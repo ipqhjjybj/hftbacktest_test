@@ -13,3 +13,4 @@ docs/_build
 data
 .venv
 target
+results

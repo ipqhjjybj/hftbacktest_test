@@ -43,6 +43,8 @@ bitmex_ask = gate_ask * (1 - ask_spread)
 
 当 BitMEX 某个方向的 base 仓位达到 `MAX_POSITION_BASE` 后，停止继续挂该方向的订单。
 
+回测日结束时，撤掉所有未成交挂单，并用 taker 单平掉 BitMEX 和 Gate 的全部剩余仓位，最终仓位必须归零。
+
 ## 动态价差
 
 把固定价差改成带库存偏斜的动态价差：
@@ -83,6 +85,7 @@ basis_skew = 0
 - BitMEX 挂单必须保持 post-only。
 - BitMEX 成交后，在 Gate 上用 taker 单对冲。
 - 尽量让 BitMEX 和 Gate 的 base 仓位保持一致。
+- 回测结束时撤掉所有挂单，并强制平掉所有剩余仓位。
 
 ## 输出结果
 
@@ -97,3 +100,6 @@ basis_skew = 0
 - Gate hedge 成交次数
 - 平均 hedge 延迟
 - 平均 hedge 滑点
+- 日终强制平仓 PnL
+- 最终 BitMEX 仓位
+- 最终 Gate 仓位
