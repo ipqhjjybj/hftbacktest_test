@@ -10,4 +10,5 @@ docs/_build
 **/tmp_*
 **/*.so
 .env
-
+data
+.venv
