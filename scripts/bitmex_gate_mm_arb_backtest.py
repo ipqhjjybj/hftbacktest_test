@@ -21,6 +21,7 @@ from hftbacktest import (
     Recorder,
     event_dtype,
 )
+from hftbacktest.order import IOC, MARKET
 from hftbacktest.data.validation import correct_event_order, correct_local_timestamp, validate_event_order
 from hftbacktest.data.utils import tardis
 
@@ -35,6 +36,7 @@ GATE_SYMBOL = "BTC_USDT"
 OPEN_LONG_SPREAD_RATIO = 0.00040
 CLOSE_SPREAD_RATIO = -0.001
 MAX_POSITION_BASE = 0.079
+ACTIVE_GATE_HEDGE = True
 
 BITMEX_TICK_SIZE = 0.1
 BITMEX_LOT_SIZE = 100.0
@@ -335,6 +337,13 @@ def manage_gate_hedge_ask(hbt, order_id):
             hbt.cancel(1, order_id, False)
         return order_id
 
+    if ACTIVE_GATE_HEDGE:
+        if existing is not None and existing.cancellable:
+            hbt.cancel(1, order_id, False)
+        order_id += 1
+        hbt.submit_sell_order(1, order_id, gate_depth.best_bid, ask_qty, IOC, MARKET, False)
+        return order_id
+
     if existing is not None:
         if existing.cancellable and (existing.price != ask_price or existing.qty != ask_qty):
             hbt.cancel(1, order_id, False)
@@ -352,13 +361,7 @@ def run_strategy(hbt, recorder):
     gate_ask_order_id = 20_000
     last_record_ts = 0
 
-    while True:
-        ret = hbt.wait_next_feed(True, 100_000_000)
-        if ret == 1:
-            break
-        if ret < 0:
-            return False
-
+    while hbt.elapse(250_000_000) == 0:
         hbt.clear_inactive_orders(ALL_ASSETS)
         bitmex_bid_order_id = manage_bitmex_bid(hbt, bitmex_bid_order_id)
         gate_ask_order_id = manage_gate_hedge_ask(hbt, gate_ask_order_id)
@@ -366,6 +369,10 @@ def run_strategy(hbt, recorder):
         if hbt.current_timestamp - last_record_ts >= 1_000_000_000:
             recorder.record(hbt)
             last_record_ts = hbt.current_timestamp
+
+    ret = hbt.elapse(1)
+    if ret < 0:
+        return False
 
     recorder.record(hbt)
     return True
@@ -440,6 +447,7 @@ def write_summary(result_npz: Path) -> None:
         "open_long_spread_ratio": OPEN_LONG_SPREAD_RATIO,
         "close_spread_ratio": CLOSE_SPREAD_RATIO,
         "max_position_base": MAX_POSITION_BASE,
+        "active_gate_hedge": ACTIVE_GATE_HEDGE,
         "bitmex_final_position_contracts": float(bitmex_final["position"]),
         "gate_final_position_contracts": float(gate_final["position"]),
         "bitmex_final_position_base": bitmex_base,
