@@ -36,13 +36,6 @@ GATE_SYMBOL = "BTC_USDT"
 OPEN_LONG_SPREAD_RATIO = 0.00035
 CLOSE_SPREAD_RATIO = 0.00016
 MAX_POSITION_BASE = 10000.0
-VOL_WIDEN = 0.0
-BASIS_SKEW = 0.0
-INVENTORY_SKEW_RATIO = 0.00020
-MIN_BID_SPREAD = 0.00010
-MAX_BID_SPREAD = 0.00070
-MIN_ASK_SPREAD = -0.00020
-MAX_ASK_SPREAD = 0.00030
 END_CLOSE_TS_NS = 1_778_630_340_000_000_000
 
 BITMEX_TICK_SIZE = 0.1
@@ -263,11 +256,6 @@ def ceil_to_tick(px, tick_size):
 @njit
 def floor_to_tick(px, tick_size):
     return math.floor(px / tick_size) * tick_size
-
-
-@njit
-def clamp(value, lower, upper):
-    return min(max(value, lower), upper)
 
 
 @njit
@@ -659,8 +647,6 @@ def write_summary(result_npz: Path, metrics: np.ndarray | None = None) -> None:
         "bitmex_bid_formula": "gate_bid * (1 - OPEN_LONG_SPREAD_RATIO)",
         "bitmex_ask_formula": "gate_ask * (1 - CLOSE_SPREAD_RATIO)",
         "max_position_base": MAX_POSITION_BASE,
-        "vol_widen": VOL_WIDEN,
-        "basis_skew": BASIS_SKEW,
         "pnl_status": pnl_status,
         "pnl_status_zh": pnl_status_zh,
         "total_pnl_usdt": total_pnl_usdt,
@@ -766,8 +752,6 @@ def render_report(summary: dict) -> str:
 - BitMEX bid 公式: `{summary['bitmex_bid_formula']}`
 - BitMEX ask 公式: `{summary['bitmex_ask_formula']}`
 - `MAX_POSITION_BASE`: `{summary['max_position_base']}`
-- `vol_widen`: `{summary['vol_widen']}`
-- `basis_skew`: `{summary['basis_skew']}`
 
 ## 盈亏
 
