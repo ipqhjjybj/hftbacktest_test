@@ -18,9 +18,9 @@
 ## 基础参数
 
 ```text
-OPEN_LONG_SPREAD_RATIO=0.00040
-CLOSE_SPREAD_RATIO=-0.001
-MAX_POSITION_BASE=0.079
+OPEN_LONG_SPREAD_RATIO=0.00035
+CLOSE_SPREAD_RATIO=0.00016
+MAX_POSITION_BASE=10000
 ```
 
 ## 策略逻辑
@@ -64,6 +64,11 @@ ask_spread = clamp(
     -0.00020,
     0.00030
 )
+
+
+bid_spread = OPEN_LONG_SPREAD_RATIO
+
+ask_spread = CLOSE_SPREAD_RATIO
 ```
 
 第一版可以先设：
