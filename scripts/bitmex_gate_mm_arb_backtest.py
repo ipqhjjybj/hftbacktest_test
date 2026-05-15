@@ -36,6 +36,7 @@ GATE_SYMBOL = "BTC_USDT"
 OPEN_LONG_SPREAD_RATIO = 0.00035
 CLOSE_SPREAD_RATIO = 0.00016
 MAX_POSITION_BASE = 10000.0
+ORDER_UPDATE_INTERVAL_NS = 10_000_000
 END_CLOSE_TS_NS = 1_778_630_340_000_000_000
 
 BITMEX_TICK_SIZE = 0.1
@@ -516,12 +517,7 @@ def run_strategy(hbt, recorder, metrics):
     last_bitmex_trades = hbt.state_values(0).num_trades
     last_bitmex_trading_value = hbt.state_values(0).trading_value
 
-    while True:
-        ret = hbt.wait_next_feed(False, 250_000_000)
-        if ret == 1:
-            break
-        if ret < 0:
-            return False
+    while hbt.elapse(ORDER_UPDATE_INTERVAL_NS) == 0:
         if hbt.current_timestamp >= END_CLOSE_TS_NS:
             break
 
@@ -647,6 +643,7 @@ def write_summary(result_npz: Path, metrics: np.ndarray | None = None) -> None:
         "bitmex_bid_formula": "gate_bid * (1 - OPEN_LONG_SPREAD_RATIO)",
         "bitmex_ask_formula": "gate_ask * (1 - CLOSE_SPREAD_RATIO)",
         "max_position_base": MAX_POSITION_BASE,
+        "order_update_interval_ms": ORDER_UPDATE_INTERVAL_NS / 1_000_000.0,
         "pnl_status": pnl_status,
         "pnl_status_zh": pnl_status_zh,
         "total_pnl_usdt": total_pnl_usdt,
@@ -752,6 +749,7 @@ def render_report(summary: dict) -> str:
 - BitMEX bid 公式: `{summary['bitmex_bid_formula']}`
 - BitMEX ask 公式: `{summary['bitmex_ask_formula']}`
 - `MAX_POSITION_BASE`: `{summary['max_position_base']}`
+- 改单间隔: `{summary['order_update_interval_ms']} ms`
 
 ## 盈亏
 
