@@ -26,7 +26,7 @@ from hftbacktest.data.validation import correct_event_order, correct_local_times
 from hftbacktest.data.utils import tardis
 
 
-DATE = "20260512"
+DATE = "20260513"
 
 BITMEX_EXCHANGE = "bitmex"
 BITMEX_SYMBOL = "XBTUSD"
@@ -35,11 +35,21 @@ GATE_SYMBOL = "BTC_USDT"
 
 OPEN_LONG_SPREAD_RATIO = 0.00035
 CLOSE_SPREAD_RATIO = 0.00016
-MAX_POSITION_BASE = 10000.0
+MAX_POSITION_BASE = 0.0001
 ORDER_UPDATE_INTERVAL_NS = 10_000_000
-END_CLOSE_TS_NS = 1_778_630_340_000_000_000
+END_CLOSE_TS_NS = 1_778_716_740_000_000_000
+GATE_TAKER_SLIPPAGE_BPS = 6.0
+BITMEX_COMMAND_INFLIGHT_NS = 80_000_000
+BITMEX_FILL_REPORT_DELAY_NS = 10_000_000
+LOCAL_GATE_SEND_DELAY_NS = 27_000
+GATE_HEDGE_INFLIGHT_NS = 20_000_000
+GATE_HEDGE_SEND_DELAY_NS = BITMEX_FILL_REPORT_DELAY_NS + LOCAL_GATE_SEND_DELAY_NS
+BITMEX_ORDER_ENTRY_LATENCY_NS = 80_000_000
+BITMEX_ORDER_RESPONSE_LATENCY_NS = 80_000_000
+GATE_ORDER_ENTRY_LATENCY_NS = 20_000_000
+GATE_ORDER_RESPONSE_LATENCY_NS = 20_000_000
 
-BITMEX_TICK_SIZE = 0.1
+BITMEX_TICK_SIZE = 0.5
 BITMEX_LOT_SIZE = 100.0
 BITMEX_CONTRACT_SIZE = 1.0
 BITMEX_ORDER_QTY = 100.0
@@ -250,6 +260,11 @@ def floor_to_lot(qty, lot_size):
 
 
 @njit
+def ceil_to_lot(qty, lot_size):
+    return math.ceil(qty / lot_size) * lot_size
+
+
+@njit
 def ceil_to_tick(px, tick_size):
     return math.ceil(px / tick_size) * tick_size
 
@@ -257,6 +272,13 @@ def ceil_to_tick(px, tick_size):
 @njit
 def floor_to_tick(px, tick_size):
     return math.floor(px / tick_size) * tick_size
+
+
+@njit
+def round_to_tick(px, tick_size):
+    if tick_size <= 0:
+        return px
+    return math.floor(px / tick_size + 0.5) * tick_size
 
 
 @njit
@@ -327,16 +349,19 @@ def cancel_all_orders(hbt, asset_no):
 
 
 @njit
-def manage_bitmex_bid(hbt, order_id):
+def manage_bitmex_bid(hbt, order_id, inflight_until):
+    if hbt.current_timestamp < inflight_until:
+        return order_id, inflight_until
+
     bitmex_depth = hbt.depth(0)
     gate_depth = hbt.depth(1)
 
     if bitmex_depth.best_bid <= 0 or bitmex_depth.best_ask <= 0:
         cancel_all_side(hbt, 0, 1)
-        return order_id
+        return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
     if gate_depth.best_bid <= 0 or gate_depth.best_ask <= 0:
         cancel_all_side(hbt, 0, 1)
-        return order_id
+        return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
 
     base_pos = current_bitmex_base(hbt)
     bitmex_mid = (bitmex_depth.best_bid + bitmex_depth.best_ask) / 2.0
@@ -344,7 +369,7 @@ def manage_bitmex_bid(hbt, order_id):
     effective_max_base = max(MAX_POSITION_BASE, order_base)
 
     bid_spread, ask_spread = dynamic_spreads(hbt)
-    raw_price = gate_depth.best_bid * (1.0 - bid_spread)
+    raw_price = min(gate_depth.best_bid * (1.0 - bid_spread), bitmex_depth.best_bid)
     bid_price = floor_to_tick(raw_price, BITMEX_TICK_SIZE)
     bid_qty = BITMEX_ORDER_QTY
 
@@ -357,30 +382,33 @@ def manage_bitmex_bid(hbt, order_id):
     if not should_quote:
         if existing is not None and existing.cancellable:
             hbt.cancel(0, order_id, False)
-        return order_id
+            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
+        return order_id, inflight_until
 
     if existing is not None:
         if existing.cancellable and (existing.price != bid_price or existing.qty != bid_qty):
-            hbt.cancel(0, order_id, False)
-            order_id += 1
-            hbt.submit_buy_order(0, order_id, bid_price, bid_qty, GTX, LIMIT, False)
-        return order_id
+            hbt.modify(0, order_id, bid_price, bid_qty, False)
+            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
+        return order_id, inflight_until
 
     hbt.submit_buy_order(0, order_id, bid_price, bid_qty, GTX, LIMIT, False)
-    return order_id
+    return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
 
 
 @njit
-def manage_bitmex_ask(hbt, order_id):
+def manage_bitmex_ask(hbt, order_id, inflight_until):
+    if hbt.current_timestamp < inflight_until:
+        return order_id, inflight_until
+
     bitmex_depth = hbt.depth(0)
     gate_depth = hbt.depth(1)
 
     if bitmex_depth.best_bid <= 0 or bitmex_depth.best_ask <= 0:
         cancel_all_side(hbt, 0, -1)
-        return order_id
+        return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
     if gate_depth.best_bid <= 0 or gate_depth.best_ask <= 0:
         cancel_all_side(hbt, 0, -1)
-        return order_id
+        return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
 
     base_pos = current_bitmex_base(hbt)
     bitmex_mid = (bitmex_depth.best_bid + bitmex_depth.best_ask) / 2.0
@@ -388,7 +416,7 @@ def manage_bitmex_ask(hbt, order_id):
     effective_max_base = max(MAX_POSITION_BASE, order_base)
 
     bid_spread, ask_spread = dynamic_spreads(hbt)
-    raw_price = gate_depth.best_ask * (1.0 - ask_spread)
+    raw_price = max(gate_depth.best_ask * (1.0 - ask_spread), bitmex_depth.best_ask)
     ask_price = ceil_to_tick(raw_price, BITMEX_TICK_SIZE)
     ask_qty = BITMEX_ORDER_QTY
 
@@ -401,27 +429,26 @@ def manage_bitmex_ask(hbt, order_id):
     if not should_quote:
         if existing is not None and existing.cancellable:
             hbt.cancel(0, order_id, False)
-        return order_id
+            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
+        return order_id, inflight_until
 
     if existing is not None:
         if existing.cancellable and (existing.price != ask_price or existing.qty != ask_qty):
-            hbt.cancel(0, order_id, False)
-            order_id += 1
-            hbt.submit_sell_order(0, order_id, ask_price, ask_qty, GTX, LIMIT, False)
-        return order_id
+            hbt.modify(0, order_id, ask_price, ask_qty, False)
+            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
+        return order_id, inflight_until
 
     hbt.submit_sell_order(0, order_id, ask_price, ask_qty, GTX, LIMIT, False)
-    return order_id
+    return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
 
 
 @njit
-def hedge_gate_net_exposure(hbt, order_id, metrics, bitmex_delta_contracts, bitmex_exec_px):
+def submit_gate_hedge_order(
+    hbt, order_id, metrics, side, hedge_qty, bitmex_delta_contracts, bitmex_exec_px, hedge_wait_start_ts
+):
     gate_depth = hbt.depth(1)
     if gate_depth.best_bid <= 0 or gate_depth.best_ask <= 0:
         return order_id
-
-    hedge_needed_base = current_bitmex_base(hbt) + current_gate_base(hbt)
-    hedge_qty = floor_to_lot(abs(hedge_needed_base) / GATE_CONTRACT_SIZE, GATE_LOT_SIZE)
     if hedge_qty < GATE_LOT_SIZE:
         return order_id
 
@@ -431,15 +458,16 @@ def hedge_gate_net_exposure(hbt, order_id, metrics, bitmex_delta_contracts, bitm
     trades_before = state_before.num_trades
     hedge_ts = hbt.current_timestamp
     order_id += 1
+    slippage = GATE_TAKER_SLIPPAGE_BPS / 10_000.0
 
-    if hedge_needed_base > 0:
+    if side < 0:
         expected_px = gate_depth.best_bid
-        hbt.submit_sell_order(1, order_id, expected_px, hedge_qty, IOC, MARKET, True)
-        side = -1.0
+        limit_px = round_to_tick(expected_px * (1.0 - slippage), GATE_TICK_SIZE)
+        hbt.submit_sell_order(1, order_id, limit_px, hedge_qty, IOC, LIMIT, True)
     else:
         expected_px = gate_depth.best_ask
-        hbt.submit_buy_order(1, order_id, expected_px, hedge_qty, IOC, MARKET, True)
-        side = 1.0
+        limit_px = round_to_tick(expected_px * (1.0 + slippage), GATE_TICK_SIZE)
+        hbt.submit_buy_order(1, order_id, limit_px, hedge_qty, IOC, LIMIT, True)
 
     state_after = hbt.state_values(1)
     if state_after.num_trades > trades_before:
@@ -465,8 +493,50 @@ def hedge_gate_net_exposure(hbt, order_id, metrics, bitmex_delta_contracts, bitm
                 metrics[14] += paired_edge
                 metrics[15] += 1
         metrics[5] += state_after.num_trades - trades_before
-        metrics[6] += hbt.current_timestamp - hedge_ts
+        if hedge_wait_start_ts > 0:
+            metrics[6] += hbt.current_timestamp - hedge_wait_start_ts
+        else:
+            metrics[6] += hbt.current_timestamp - hedge_ts
         metrics[7] += 1
+    return order_id
+
+
+@njit
+def hedge_gate_net_exposure(hbt, order_id, metrics, bitmex_delta_contracts, bitmex_exec_px, hedge_wait_start_ts):
+    gate_depth = hbt.depth(1)
+    if gate_depth.best_bid <= 0 or gate_depth.best_ask <= 0:
+        return order_id
+
+    hedge_needed_base = current_bitmex_base(hbt) + current_gate_base(hbt)
+    target_qty = abs(hedge_needed_base) / GATE_CONTRACT_SIZE
+    if target_qty <= 0:
+        return order_id
+
+    if hedge_needed_base > 0:
+        side = -1.0
+    else:
+        side = 1.0
+
+    gate_pos = hbt.position(1)
+    closing_qty = 0.0
+    if side < 0 and gate_pos > 0:
+        closing_qty = floor_to_lot(min(gate_pos, target_qty), GATE_LOT_SIZE)
+    elif side > 0 and gate_pos < 0:
+        closing_qty = floor_to_lot(min(abs(gate_pos), target_qty), GATE_LOT_SIZE)
+
+    opening_qty = 0.0
+    remaining_qty = target_qty - closing_qty
+    if remaining_qty > 0:
+        opening_qty = ceil_to_lot(remaining_qty, GATE_LOT_SIZE)
+
+    if closing_qty >= GATE_LOT_SIZE:
+        order_id = submit_gate_hedge_order(
+            hbt, order_id, metrics, side, closing_qty, bitmex_delta_contracts, bitmex_exec_px, hedge_wait_start_ts
+        )
+    if opening_qty >= GATE_LOT_SIZE:
+        order_id = submit_gate_hedge_order(
+            hbt, order_id, metrics, side, opening_qty, bitmex_delta_contracts, bitmex_exec_px, hedge_wait_start_ts
+        )
     return order_id
 
 
@@ -512,6 +582,13 @@ def run_strategy(hbt, recorder, metrics):
     bitmex_bid_order_id = 10_000
     bitmex_ask_order_id = 20_000
     gate_hedge_order_id = 30_000
+    bitmex_bid_inflight_until = 0
+    bitmex_ask_inflight_until = 0
+    gate_hedge_inflight_until = 0
+    pending_gate_hedge_due_ts = 0
+    pending_gate_hedge_start_ts = 0
+    pending_bitmex_delta_contracts = 0.0
+    pending_bitmex_delta_value = 0.0
     last_record_ts = 0
     last_bitmex_pos = hbt.position(0)
     last_bitmex_trades = hbt.state_values(0).num_trades
@@ -522,8 +599,12 @@ def run_strategy(hbt, recorder, metrics):
             break
 
         hbt.clear_inactive_orders(ALL_ASSETS)
-        bitmex_bid_order_id = manage_bitmex_bid(hbt, bitmex_bid_order_id)
-        bitmex_ask_order_id = manage_bitmex_ask(hbt, bitmex_ask_order_id)
+        bitmex_bid_order_id, bitmex_bid_inflight_until = manage_bitmex_bid(
+            hbt, bitmex_bid_order_id, bitmex_bid_inflight_until
+        )
+        bitmex_ask_order_id, bitmex_ask_inflight_until = manage_bitmex_ask(
+            hbt, bitmex_ask_order_id, bitmex_ask_inflight_until
+        )
 
         bitmex_state = hbt.state_values(0)
         if bitmex_state.num_trades > last_bitmex_trades:
@@ -543,9 +624,41 @@ def run_strategy(hbt, recorder, metrics):
             last_bitmex_pos = bitmex_state.position
             last_bitmex_trades = bitmex_state.num_trades
             last_bitmex_trading_value = bitmex_state.trading_value
-            gate_hedge_order_id = hedge_gate_net_exposure(
-                hbt, gate_hedge_order_id, metrics, delta_contracts, bitmex_exec_px
-            )
+            pending_bitmex_delta_contracts += delta_contracts
+            pending_bitmex_delta_value += delta_trading_value
+            if pending_gate_hedge_due_ts == 0:
+                pending_gate_hedge_due_ts = hbt.current_timestamp + GATE_HEDGE_SEND_DELAY_NS
+                pending_gate_hedge_start_ts = hbt.current_timestamp
+            metrics[20] += 1
+
+        if (
+            pending_gate_hedge_due_ts > 0
+            and hbt.current_timestamp >= pending_gate_hedge_due_ts
+            and hbt.current_timestamp >= gate_hedge_inflight_until
+        ):
+            gate_depth = hbt.depth(1)
+            if gate_depth.best_bid > 0 and gate_depth.best_ask > 0:
+                pending_bitmex_exec_px = 0.0
+                if abs(pending_bitmex_delta_contracts) > 0 and pending_bitmex_delta_value > 0:
+                    pending_bitmex_exec_px = (
+                        abs(pending_bitmex_delta_contracts) * BITMEX_CONTRACT_SIZE / pending_bitmex_delta_value
+                    )
+                previous_gate_hedge_order_id = gate_hedge_order_id
+                gate_hedge_order_id = hedge_gate_net_exposure(
+                    hbt,
+                    gate_hedge_order_id,
+                    metrics,
+                    pending_bitmex_delta_contracts,
+                    pending_bitmex_exec_px,
+                    pending_gate_hedge_start_ts,
+                )
+                if gate_hedge_order_id != previous_gate_hedge_order_id:
+                    gate_hedge_inflight_until = hbt.current_timestamp + GATE_HEDGE_INFLIGHT_NS
+                    metrics[21] += 1
+                pending_gate_hedge_due_ts = 0
+                pending_gate_hedge_start_ts = 0
+                pending_bitmex_delta_contracts = 0.0
+                pending_bitmex_delta_value = 0.0
 
         update_risk_metrics(hbt, metrics)
 
@@ -564,8 +677,8 @@ def run_backtest(bitmex_npz: Path, gate_npz: Path) -> Path:
         BacktestAsset()
         .data([str(bitmex_npz)])
         .inverse_asset(BITMEX_CONTRACT_SIZE)
-        .constant_order_latency(0, 0)
-        .power_prob_queue_model3(3.0)
+        .constant_order_latency(BITMEX_ORDER_ENTRY_LATENCY_NS, BITMEX_ORDER_RESPONSE_LATENCY_NS)
+        .risk_adverse_queue_model()
         .no_partial_fill_exchange()
         .trading_value_fee_model(0.0, 0.0)
         .tick_size(BITMEX_TICK_SIZE)
@@ -576,7 +689,7 @@ def run_backtest(bitmex_npz: Path, gate_npz: Path) -> Path:
         BacktestAsset()
         .data([str(gate_npz)])
         .linear_asset(GATE_CONTRACT_SIZE)
-        .constant_order_latency(0, 0)
+        .constant_order_latency(GATE_ORDER_ENTRY_LATENCY_NS, GATE_ORDER_RESPONSE_LATENCY_NS)
         .power_prob_queue_model3(3.0)
         .no_partial_fill_exchange()
         .trading_value_fee_model(0.0, 0.0)
@@ -642,8 +755,28 @@ def write_summary(result_npz: Path, metrics: np.ndarray | None = None) -> None:
         "close_spread_ratio": CLOSE_SPREAD_RATIO,
         "bitmex_bid_formula": "gate_bid * (1 - OPEN_LONG_SPREAD_RATIO)",
         "bitmex_ask_formula": "gate_ask * (1 - CLOSE_SPREAD_RATIO)",
+        "bitmex_quote_bbo_clamp": True,
         "max_position_base": MAX_POSITION_BASE,
         "order_update_interval_ms": ORDER_UPDATE_INTERVAL_NS / 1_000_000.0,
+        "gate_hedge_order_type": "IOC LIMIT",
+        "gate_taker_slippage_bps": GATE_TAKER_SLIPPAGE_BPS,
+        "gate_hedge_open_qty_rounding": "ceil_to_lot",
+        "gate_hedge_close_qty_rounding": "floor_to_lot",
+        "bitmex_command_inflight_ms": BITMEX_COMMAND_INFLIGHT_NS / 1_000_000.0,
+        "bitmex_fill_report_delay_ms": BITMEX_FILL_REPORT_DELAY_NS / 1_000_000.0,
+        "local_gate_send_delay_ms": LOCAL_GATE_SEND_DELAY_NS / 1_000_000.0,
+        "gate_hedge_send_delay_ms": GATE_HEDGE_SEND_DELAY_NS / 1_000_000.0,
+        "gate_hedge_inflight_ms": GATE_HEDGE_INFLIGHT_NS / 1_000_000.0,
+        "bitmex_tick_size": BITMEX_TICK_SIZE,
+        "gate_tick_size": GATE_TICK_SIZE,
+        "bitmex_order_entry_latency_ms": BITMEX_ORDER_ENTRY_LATENCY_NS / 1_000_000.0,
+        "bitmex_order_response_latency_ms": BITMEX_ORDER_RESPONSE_LATENCY_NS / 1_000_000.0,
+        "gate_order_entry_latency_ms": GATE_ORDER_ENTRY_LATENCY_NS / 1_000_000.0,
+        "gate_order_response_latency_ms": GATE_ORDER_RESPONSE_LATENCY_NS / 1_000_000.0,
+        "bitmex_queue_model": "risk_adverse_queue_model",
+        "gate_queue_model": "power_prob_queue_model3(3.0)",
+        "bitmex_fill_hedge_enqueue_events": int(metrics[20]),
+        "gate_hedge_send_events": int(metrics[21]),
         "pnl_status": pnl_status,
         "pnl_status_zh": pnl_status_zh,
         "total_pnl_usdt": total_pnl_usdt,
@@ -716,6 +849,8 @@ def render_console_summary(summary: dict) -> str:
         f"BitMEX maker 成交次数: {summary['bitmex_maker_fills']}",
         f"  买成交: {summary['bitmex_buy_fills']}, 卖成交: {summary['bitmex_sell_fills']}",
         f"Gate hedge 成交次数: {summary['gate_hedge_fills']}",
+        f"Gate hedge 发送事件: {summary['gate_hedge_send_events']}",
+        f"平均 hedge 延迟: {summary['avg_hedge_delay_ms']:,.4f} ms",
         f"实际配对边际: {signed_money(summary['paired_edge_pnl_usdt'])}",
         f"平均配对边际: {summary['avg_paired_edge_usdt_per_btc']:,.4f} USDT/BTC",
         f"  BitMEX买->Gate卖: {summary['avg_bitmex_buy_then_gate_sell_edge_usdt_per_btc']:,.4f} USDT/BTC",
@@ -748,8 +883,24 @@ def render_report(summary: dict) -> str:
 - `CLOSE_SPREAD_RATIO`: `{summary['close_spread_ratio']}`
 - BitMEX bid 公式: `{summary['bitmex_bid_formula']}`
 - BitMEX ask 公式: `{summary['bitmex_ask_formula']}`
+- BitMEX BBO clamp: `{summary['bitmex_quote_bbo_clamp']}`
 - `MAX_POSITION_BASE`: `{summary['max_position_base']}`
 - 改单间隔: `{summary['order_update_interval_ms']} ms`
+- Gate hedge 订单类型: `{summary['gate_hedge_order_type']}`
+- Gate hedge 滑点保护: `{summary['gate_taker_slippage_bps']} bps`
+- Gate hedge 开仓数量取整: `{summary['gate_hedge_open_qty_rounding']}`
+- Gate hedge 平仓数量取整: `{summary['gate_hedge_close_qty_rounding']}`
+- BitMEX command inflight: `{summary['bitmex_command_inflight_ms']} ms`
+- Gate hedge send delay: `{summary['gate_hedge_send_delay_ms']} ms`
+- BitMEX fill report delay: `{summary['bitmex_fill_report_delay_ms']} ms`
+- Local Gate send delay: `{summary['local_gate_send_delay_ms']} ms`
+- Gate hedge inflight: `{summary['gate_hedge_inflight_ms']} ms`
+- BitMEX tick size: `{summary['bitmex_tick_size']}`
+- Gate tick size: `{summary['gate_tick_size']}`
+- BitMEX order latency: `{summary['bitmex_order_entry_latency_ms']} ms entry`, `{summary['bitmex_order_response_latency_ms']} ms response`
+- Gate order latency: `{summary['gate_order_entry_latency_ms']} ms entry`, `{summary['gate_order_response_latency_ms']} ms response`
+- BitMEX queue model: `{summary['bitmex_queue_model']}`
+- Gate queue model: `{summary['gate_queue_model']}`
 
 ## 盈亏
 
@@ -769,6 +920,8 @@ def render_report(summary: dict) -> str:
 - BitMEX 买成交次数: `{summary['bitmex_buy_fills']}`
 - BitMEX 卖成交次数: `{summary['bitmex_sell_fills']}`
 - Gate hedge 成交次数: `{summary['gate_hedge_fills']}`
+- BitMEX fill hedge enqueue events: `{summary['bitmex_fill_hedge_enqueue_events']}`
+- Gate hedge send events: `{summary['gate_hedge_send_events']}`
 - 实际配对边际 PnL: `{signed_money(summary['paired_edge_pnl_usdt'])}`
 - 平均实际配对边际: `{summary['avg_paired_edge_usdt_per_btc']:,.4f} USDT/BTC`
 - BitMEX 买 -> Gate 卖平均边际: `{summary['avg_bitmex_buy_then_gate_sell_edge_usdt_per_btc']:,.4f} USDT/BTC`
