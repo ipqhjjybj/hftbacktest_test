@@ -1,3 +1,5 @@
+import argparse
+import datetime as dt
 import json
 import math
 from pathlib import Path
@@ -57,6 +59,10 @@ SOFT_INVENTORY_LIMIT_BASE = 0.0010
 HARD_INVENTORY_LIMIT_BASE = 0.0025
 MAX_INVENTORY_HOLD_NS = 3_000_000_000
 MAX_POSITION_BASE = 0.0030
+MAX_GROSS_POSITION_BASE = 0.02
+TARGET_BITMEX_BUY_FILLS = 10
+TARGET_BITMEX_SELL_FILLS = 10
+MAX_FILL_COUNT_IMBALANCE = 1
 
 
 @njit
@@ -95,6 +101,29 @@ def inventory_ask_spread(net_base):
 
 
 @njit
+def gross_position_base(hbt):
+    return abs(current_bitmex_base(hbt)) + abs(current_gate_base(hbt))
+
+
+@njit
+def allow_bid_by_fill_balance(buy_fills, sell_fills, net_base):
+    if net_base < -SOFT_INVENTORY_LIMIT_BASE:
+        return True
+    if buy_fills >= TARGET_BITMEX_BUY_FILLS:
+        return False
+    return buy_fills - sell_fills < MAX_FILL_COUNT_IMBALANCE
+
+
+@njit
+def allow_ask_by_fill_balance(buy_fills, sell_fills, net_base):
+    if net_base > SOFT_INVENTORY_LIMIT_BASE:
+        return True
+    if sell_fills >= TARGET_BITMEX_SELL_FILLS:
+        return False
+    return sell_fills - buy_fills < MAX_FILL_COUNT_IMBALANCE
+
+
+@njit
 def cancel_all_side(hbt, asset_no, side):
     orders = hbt.orders(asset_no)
     values = orders.values()
@@ -105,7 +134,7 @@ def cancel_all_side(hbt, asset_no, side):
 
 
 @njit
-def manage_inventory_bid(hbt, order_id, inflight_until):
+def manage_inventory_bid(hbt, order_id, inflight_until, buy_fills, sell_fills):
     if hbt.current_timestamp < inflight_until:
         return order_id, inflight_until
 
@@ -121,13 +150,17 @@ def manage_inventory_bid(hbt, order_id, inflight_until):
     bitmex_mid = (bitmex_depth.best_bid + bitmex_depth.best_ask) / 2.0
     order_base = bitmex_base_from_contracts(BITMEX_ORDER_QTY, bitmex_mid)
     net_base = current_bitmex_base(hbt) + current_gate_base(hbt)
+    gross_base = gross_position_base(hbt)
     spread = inventory_bid_spread(net_base)
     bid_price = floor_to_tick(min(gate_depth.best_bid * (1.0 - spread), bitmex_depth.best_bid), BITMEX_TICK_SIZE)
     existing = hbt.orders(0).get(order_id)
+    reduces_net = net_base < -SOFT_INVENTORY_LIMIT_BASE
 
     should_quote = (
-        net_base < SOFT_INVENTORY_LIMIT_BASE
+        allow_bid_by_fill_balance(buy_fills, sell_fills, net_base)
+        and net_base < SOFT_INVENTORY_LIMIT_BASE
         and abs(net_base + order_base) <= MAX_POSITION_BASE
+        and (gross_base + order_base <= MAX_GROSS_POSITION_BASE or reduces_net)
         and bid_price > 0
         and BITMEX_ORDER_QTY >= BITMEX_LOT_SIZE
     )
@@ -148,7 +181,7 @@ def manage_inventory_bid(hbt, order_id, inflight_until):
 
 
 @njit
-def manage_inventory_ask(hbt, order_id, inflight_until):
+def manage_inventory_ask(hbt, order_id, inflight_until, buy_fills, sell_fills):
     if hbt.current_timestamp < inflight_until:
         return order_id, inflight_until
 
@@ -164,13 +197,17 @@ def manage_inventory_ask(hbt, order_id, inflight_until):
     bitmex_mid = (bitmex_depth.best_bid + bitmex_depth.best_ask) / 2.0
     order_base = bitmex_base_from_contracts(BITMEX_ORDER_QTY, bitmex_mid)
     net_base = current_bitmex_base(hbt) + current_gate_base(hbt)
+    gross_base = gross_position_base(hbt)
     spread = inventory_ask_spread(net_base)
     ask_price = ceil_to_tick(max(gate_depth.best_ask * (1.0 + spread), bitmex_depth.best_ask), BITMEX_TICK_SIZE)
     existing = hbt.orders(0).get(order_id)
+    reduces_net = net_base > SOFT_INVENTORY_LIMIT_BASE
 
     should_quote = (
-        net_base > -SOFT_INVENTORY_LIMIT_BASE
+        allow_ask_by_fill_balance(buy_fills, sell_fills, net_base)
+        and net_base > -SOFT_INVENTORY_LIMIT_BASE
         and abs(net_base - order_base) <= MAX_POSITION_BASE
+        and (gross_base + order_base <= MAX_GROSS_POSITION_BASE or reduces_net)
         and ask_price > 0
         and BITMEX_ORDER_QTY >= BITMEX_LOT_SIZE
     )
@@ -244,10 +281,10 @@ def run_inventory_strategy(hbt, recorder, metrics):
         hbt.clear_inactive_orders(1)
 
         bitmex_bid_order_id, bitmex_bid_inflight_until = manage_inventory_bid(
-            hbt, bitmex_bid_order_id, bitmex_bid_inflight_until
+            hbt, bitmex_bid_order_id, bitmex_bid_inflight_until, metrics[11], metrics[12]
         )
         bitmex_ask_order_id, bitmex_ask_inflight_until = manage_inventory_ask(
-            hbt, bitmex_ask_order_id, bitmex_ask_inflight_until
+            hbt, bitmex_ask_order_id, bitmex_ask_inflight_until, metrics[11], metrics[12]
         )
 
         bitmex_state = hbt.state_values(0)
@@ -386,6 +423,10 @@ def write_summary(result_npz: Path, metrics: np.ndarray | None = None) -> None:
         "hard_inventory_limit_base": HARD_INVENTORY_LIMIT_BASE,
         "max_inventory_hold_ms": MAX_INVENTORY_HOLD_NS / 1_000_000.0,
         "max_position_base": MAX_POSITION_BASE,
+        "max_gross_position_limit_base": MAX_GROSS_POSITION_BASE,
+        "target_bitmex_buy_fills": TARGET_BITMEX_BUY_FILLS,
+        "target_bitmex_sell_fills": TARGET_BITMEX_SELL_FILLS,
+        "max_fill_count_imbalance": MAX_FILL_COUNT_IMBALANCE,
         "bitmex_maker_fills": int(metrics[4]),
         "bitmex_buy_fills": int(metrics[11]),
         "bitmex_sell_fills": int(metrics[12]),
@@ -466,6 +507,10 @@ def render_report(summary: dict) -> str:
 - hard inventory: `{signed_base(summary['hard_inventory_limit_base'])}`
 - max hold: `{summary['max_inventory_hold_ms']} ms`
 - max position: `{signed_base(summary['max_position_base'])}`
+- max gross position: `{signed_base(summary['max_gross_position_limit_base'])}`
+- target BitMEX buy fills: `{summary['target_bitmex_buy_fills']}`
+- target BitMEX sell fills: `{summary['target_bitmex_sell_fills']}`
+- max fill count imbalance: `{summary['max_fill_count_imbalance']}`
 
 ## 结果
 
@@ -484,7 +529,23 @@ def render_report(summary: dict) -> str:
 """
 
 
+def day_end_ns(yyyymmdd: str) -> int:
+    day = dt.datetime.strptime(yyyymmdd, "%Y%m%d").replace(tzinfo=dt.timezone.utc)
+    return int((day + dt.timedelta(days=1)).timestamp() * 1_000_000_000)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run BitMEX/Gate inventory backtest.")
+    parser.add_argument("--date", default=DATE, help="UTC trading date in YYYYMMDD format")
+    return parser.parse_args()
+
+
 def main() -> None:
+    global DATE, END_CLOSE_TS_NS
+    args = parse_args()
+    DATE = args.date
+    END_CLOSE_TS_NS = day_end_ns(DATE)
+
     NPZ_DIR.mkdir(parents=True, exist_ok=True)
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
