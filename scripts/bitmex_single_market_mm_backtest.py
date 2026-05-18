@@ -57,6 +57,7 @@ TOXIC_FILL_MID_MOVE_BPS = 1.5
 CSV_DIR = Path("data/tardis_csv")
 NPZ_DIR = Path("data/npz")
 RESULT_DIR = Path("results")
+RESULT_TAG = ""
 
 
 def load_env(path: Path = Path(".env")) -> None:
@@ -676,7 +677,8 @@ def run_backtest(bitmex_npz: Path, yyyymmdd: str) -> Path:
 
     ttl_ms = int(ORDER_TTL_NS / 1_000_000)
     half_spread_tag = str(BASE_HALF_SPREAD_BPS).replace(".", "p")
-    out = RESULT_DIR / f"bitmex_xbtusd_single_market_mm_hs{half_spread_tag}_ttl{ttl_ms}_{yyyymmdd}.npz"
+    param_tag = RESULT_TAG or f"hs{half_spread_tag}_ttl{ttl_ms}"
+    out = RESULT_DIR / f"bitmex_xbtusd_single_market_mm_{param_tag}_{yyyymmdd}.npz"
     np.savez_compressed(out, **{"0": recorder.get(0), "metrics": metrics})
     write_summary(out, metrics, yyyymmdd)
     return out
@@ -714,6 +716,7 @@ def write_summary(result_npz: Path, metrics: np.ndarray | None = None, yyyymmdd:
         "date": yyyymmdd,
         "symbol": BITMEX_SYMBOL,
         "strategy": "single_market_mm",
+        "result_tag": RESULT_TAG,
         "base_half_spread_bps": BASE_HALF_SPREAD_BPS,
         "min_half_spread_ticks": MIN_HALF_SPREAD_TICKS,
         "max_position_contracts": MAX_POSITION_CONTRACTS,
@@ -872,6 +875,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--momentum-cancel-bps", type=float, default=MOMENTUM_CANCEL_BPS)
     parser.add_argument("--microprice-cancel-bps", type=float, default=MICROPRICE_CANCEL_BPS)
     parser.add_argument("--vol-spread-multiplier", type=float, default=VOL_SPREAD_MULTIPLIER)
+    parser.add_argument("--result-tag", default="", help="Optional tag used in output filenames.")
     return parser.parse_args()
 
 
@@ -884,6 +888,7 @@ def main() -> None:
     global MOMENTUM_CANCEL_BPS
     global MICROPRICE_CANCEL_BPS
     global VOL_SPREAD_MULTIPLIER
+    global RESULT_TAG
 
     args = parse_args()
     BASE_HALF_SPREAD_BPS = args.base_half_spread_bps
@@ -894,6 +899,7 @@ def main() -> None:
     MOMENTUM_CANCEL_BPS = args.momentum_cancel_bps
     MICROPRICE_CANCEL_BPS = args.microprice_cancel_bps
     VOL_SPREAD_MULTIPLIER = args.vol_spread_multiplier
+    RESULT_TAG = args.result_tag
 
     CSV_DIR.mkdir(parents=True, exist_ok=True)
     NPZ_DIR.mkdir(parents=True, exist_ok=True)
