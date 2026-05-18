@@ -62,7 +62,11 @@ MAX_POSITION_BASE = 0.0030
 MAX_GROSS_POSITION_BASE = 0.02
 TARGET_BITMEX_BUY_FILLS = 10
 TARGET_BITMEX_SELL_FILLS = 10
-MAX_FILL_COUNT_IMBALANCE = 1
+FILL_BALANCE_WINDOW_NS = 10 * 60 * 1_000_000_000
+MAX_WINDOW_BITMEX_MAKER_FILLS = TARGET_BITMEX_BUY_FILLS + TARGET_BITMEX_SELL_FILLS
+MAX_SIDE_OVERFILL = 3
+FILL_BALANCE_SKEW_BPS = 6.0
+MAX_FILL_BALANCE_SKEW_BPS = 30.0
 
 
 @njit
@@ -106,21 +110,35 @@ def gross_position_base(hbt):
 
 
 @njit
-def allow_bid_by_fill_balance(buy_fills, sell_fills, net_base):
-    if net_base < -SOFT_INVENTORY_LIMIT_BASE:
-        return True
-    if buy_fills >= TARGET_BITMEX_BUY_FILLS:
-        return False
-    return buy_fills - sell_fills < MAX_FILL_COUNT_IMBALANCE
+def fill_balance_bid_adjustment(buy_fills, sell_fills):
+    imbalance = buy_fills - sell_fills
+    bps = clamp(imbalance * FILL_BALANCE_SKEW_BPS, -MAX_FILL_BALANCE_SKEW_BPS, MAX_FILL_BALANCE_SKEW_BPS)
+    return bps / 10_000.0
 
 
 @njit
-def allow_ask_by_fill_balance(buy_fills, sell_fills, net_base):
+def fill_balance_ask_adjustment(buy_fills, sell_fills):
+    imbalance = buy_fills - sell_fills
+    bps = clamp(imbalance * FILL_BALANCE_SKEW_BPS, -MAX_FILL_BALANCE_SKEW_BPS, MAX_FILL_BALANCE_SKEW_BPS)
+    return -bps / 10_000.0
+
+
+@njit
+def allow_bid_by_window_fill_cap(buy_fills, sell_fills, net_base):
+    if net_base < -SOFT_INVENTORY_LIMIT_BASE:
+        return True
+    if buy_fills + sell_fills >= MAX_WINDOW_BITMEX_MAKER_FILLS:
+        return False
+    return buy_fills < TARGET_BITMEX_BUY_FILLS + MAX_SIDE_OVERFILL
+
+
+@njit
+def allow_ask_by_window_fill_cap(buy_fills, sell_fills, net_base):
     if net_base > SOFT_INVENTORY_LIMIT_BASE:
         return True
-    if sell_fills >= TARGET_BITMEX_SELL_FILLS:
+    if buy_fills + sell_fills >= MAX_WINDOW_BITMEX_MAKER_FILLS:
         return False
-    return sell_fills - buy_fills < MAX_FILL_COUNT_IMBALANCE
+    return sell_fills < TARGET_BITMEX_SELL_FILLS + MAX_SIDE_OVERFILL
 
 
 @njit
@@ -151,16 +169,16 @@ def manage_inventory_bid(hbt, order_id, inflight_until, buy_fills, sell_fills):
     order_base = bitmex_base_from_contracts(BITMEX_ORDER_QTY, bitmex_mid)
     net_base = current_bitmex_base(hbt) + current_gate_base(hbt)
     gross_base = gross_position_base(hbt)
-    spread = inventory_bid_spread(net_base)
+    spread = inventory_bid_spread(net_base) + fill_balance_bid_adjustment(buy_fills, sell_fills)
     bid_price = floor_to_tick(min(gate_depth.best_bid * (1.0 - spread), bitmex_depth.best_bid), BITMEX_TICK_SIZE)
     existing = hbt.orders(0).get(order_id)
     reduces_net = net_base < -SOFT_INVENTORY_LIMIT_BASE
 
     should_quote = (
-        allow_bid_by_fill_balance(buy_fills, sell_fills, net_base)
-        and net_base < SOFT_INVENTORY_LIMIT_BASE
+        net_base < SOFT_INVENTORY_LIMIT_BASE
         and abs(net_base + order_base) <= MAX_POSITION_BASE
         and (gross_base + order_base <= MAX_GROSS_POSITION_BASE or reduces_net)
+        and allow_bid_by_window_fill_cap(buy_fills, sell_fills, net_base)
         and bid_price > 0
         and BITMEX_ORDER_QTY >= BITMEX_LOT_SIZE
     )
@@ -198,16 +216,16 @@ def manage_inventory_ask(hbt, order_id, inflight_until, buy_fills, sell_fills):
     order_base = bitmex_base_from_contracts(BITMEX_ORDER_QTY, bitmex_mid)
     net_base = current_bitmex_base(hbt) + current_gate_base(hbt)
     gross_base = gross_position_base(hbt)
-    spread = inventory_ask_spread(net_base)
+    spread = inventory_ask_spread(net_base) + fill_balance_ask_adjustment(buy_fills, sell_fills)
     ask_price = ceil_to_tick(max(gate_depth.best_ask * (1.0 + spread), bitmex_depth.best_ask), BITMEX_TICK_SIZE)
     existing = hbt.orders(0).get(order_id)
     reduces_net = net_base > SOFT_INVENTORY_LIMIT_BASE
 
     should_quote = (
-        allow_ask_by_fill_balance(buy_fills, sell_fills, net_base)
-        and net_base > -SOFT_INVENTORY_LIMIT_BASE
+        net_base > -SOFT_INVENTORY_LIMIT_BASE
         and abs(net_base - order_base) <= MAX_POSITION_BASE
         and (gross_base + order_base <= MAX_GROSS_POSITION_BASE or reduces_net)
+        and allow_ask_by_window_fill_cap(buy_fills, sell_fills, net_base)
         and ask_price > 0
         and BITMEX_ORDER_QTY >= BITMEX_LOT_SIZE
     )
@@ -268,6 +286,9 @@ def run_inventory_strategy(hbt, recorder, metrics):
     bitmex_ask_inflight_until = 0
     gate_inflight_until = 0
     inventory_enter_ts = 0
+    fill_balance_window_start_ts = 0
+    window_buy_fills = 0.0
+    window_sell_fills = 0.0
     last_record_ts = 0
     last_bitmex_pos = hbt.position(0)
     last_bitmex_trades = hbt.state_values(0).num_trades
@@ -277,14 +298,21 @@ def run_inventory_strategy(hbt, recorder, metrics):
         if hbt.current_timestamp >= END_CLOSE_TS_NS:
             break
 
+        if fill_balance_window_start_ts == 0:
+            fill_balance_window_start_ts = hbt.current_timestamp
+        if hbt.current_timestamp - fill_balance_window_start_ts >= FILL_BALANCE_WINDOW_NS:
+            fill_balance_window_start_ts = hbt.current_timestamp
+            window_buy_fills = 0.0
+            window_sell_fills = 0.0
+
         hbt.clear_inactive_orders(0)
         hbt.clear_inactive_orders(1)
 
         bitmex_bid_order_id, bitmex_bid_inflight_until = manage_inventory_bid(
-            hbt, bitmex_bid_order_id, bitmex_bid_inflight_until, metrics[11], metrics[12]
+            hbt, bitmex_bid_order_id, bitmex_bid_inflight_until, window_buy_fills, window_sell_fills
         )
         bitmex_ask_order_id, bitmex_ask_inflight_until = manage_inventory_ask(
-            hbt, bitmex_ask_order_id, bitmex_ask_inflight_until, metrics[11], metrics[12]
+            hbt, bitmex_ask_order_id, bitmex_ask_inflight_until, window_buy_fills, window_sell_fills
         )
 
         bitmex_state = hbt.state_values(0)
@@ -297,8 +325,10 @@ def run_inventory_strategy(hbt, recorder, metrics):
             metrics[4] += bitmex_state.num_trades - last_bitmex_trades
             if delta_contracts > 0:
                 metrics[11] += bitmex_state.num_trades - last_bitmex_trades
+                window_buy_fills += bitmex_state.num_trades - last_bitmex_trades
             elif delta_contracts < 0:
                 metrics[12] += bitmex_state.num_trades - last_bitmex_trades
+                window_sell_fills += bitmex_state.num_trades - last_bitmex_trades
             last_bitmex_pos = bitmex_state.position
             last_bitmex_trades = bitmex_state.num_trades
             last_bitmex_trading_value = bitmex_state.trading_value
@@ -426,7 +456,11 @@ def write_summary(result_npz: Path, metrics: np.ndarray | None = None) -> None:
         "max_gross_position_limit_base": MAX_GROSS_POSITION_BASE,
         "target_bitmex_buy_fills": TARGET_BITMEX_BUY_FILLS,
         "target_bitmex_sell_fills": TARGET_BITMEX_SELL_FILLS,
-        "max_fill_count_imbalance": MAX_FILL_COUNT_IMBALANCE,
+        "fill_balance_window_ms": FILL_BALANCE_WINDOW_NS / 1_000_000.0,
+        "max_window_bitmex_maker_fills": MAX_WINDOW_BITMEX_MAKER_FILLS,
+        "max_side_overfill": MAX_SIDE_OVERFILL,
+        "fill_balance_skew_bps": FILL_BALANCE_SKEW_BPS,
+        "max_fill_balance_skew_bps": MAX_FILL_BALANCE_SKEW_BPS,
         "bitmex_maker_fills": int(metrics[4]),
         "bitmex_buy_fills": int(metrics[11]),
         "bitmex_sell_fills": int(metrics[12]),
@@ -510,7 +544,11 @@ def render_report(summary: dict) -> str:
 - max gross position: `{signed_base(summary['max_gross_position_limit_base'])}`
 - target BitMEX buy fills: `{summary['target_bitmex_buy_fills']}`
 - target BitMEX sell fills: `{summary['target_bitmex_sell_fills']}`
-- max fill count imbalance: `{summary['max_fill_count_imbalance']}`
+- fill balance window: `{summary['fill_balance_window_ms']} ms`
+- max window BitMEX maker fills: `{summary['max_window_bitmex_maker_fills']}`
+- max side overfill: `{summary['max_side_overfill']}`
+- fill balance skew: `{summary['fill_balance_skew_bps']} bps per fill`
+- max fill balance skew: `{summary['max_fill_balance_skew_bps']} bps`
 
 ## 结果
 
@@ -537,14 +575,52 @@ def day_end_ns(yyyymmdd: str) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run BitMEX/Gate inventory backtest.")
     parser.add_argument("--date", default=DATE, help="UTC trading date in YYYYMMDD format")
+    parser.add_argument("--base-bid-spread-bps", type=float, default=BASE_BID_SPREAD_RATIO * 10_000.0)
+    parser.add_argument("--base-ask-spread-bps", type=float, default=BASE_ASK_SPREAD_RATIO * 10_000.0)
+    parser.add_argument("--inventory-skew-bps", type=float, default=INVENTORY_SKEW_BPS)
+    parser.add_argument("--max-reduce-cross-bps", type=float, default=MAX_REDUCE_QUOTE_CROSS_BPS)
+    parser.add_argument("--soft-inventory-base", type=float, default=SOFT_INVENTORY_LIMIT_BASE)
+    parser.add_argument("--hard-inventory-base", type=float, default=HARD_INVENTORY_LIMIT_BASE)
+    parser.add_argument("--max-hold-ms", type=float, default=MAX_INVENTORY_HOLD_NS / 1_000_000.0)
+    parser.add_argument("--max-position-base", type=float, default=MAX_POSITION_BASE)
+    parser.add_argument("--max-gross-base", type=float, default=MAX_GROSS_POSITION_BASE)
+    parser.add_argument("--target-buy-fills", type=int, default=TARGET_BITMEX_BUY_FILLS)
+    parser.add_argument("--target-sell-fills", type=int, default=TARGET_BITMEX_SELL_FILLS)
+    parser.add_argument("--fill-window-min", type=float, default=FILL_BALANCE_WINDOW_NS / 60_000_000_000.0)
+    parser.add_argument("--max-window-fills", type=int, default=MAX_WINDOW_BITMEX_MAKER_FILLS)
+    parser.add_argument("--max-side-overfill", type=int, default=MAX_SIDE_OVERFILL)
+    parser.add_argument("--fill-balance-skew-bps", type=float, default=FILL_BALANCE_SKEW_BPS)
+    parser.add_argument("--max-fill-balance-skew-bps", type=float, default=MAX_FILL_BALANCE_SKEW_BPS)
     return parser.parse_args()
 
 
 def main() -> None:
     global DATE, END_CLOSE_TS_NS
+    global BASE_BID_SPREAD_RATIO, BASE_ASK_SPREAD_RATIO, INVENTORY_SKEW_BPS
+    global MAX_REDUCE_QUOTE_CROSS_BPS, SOFT_INVENTORY_LIMIT_BASE, HARD_INVENTORY_LIMIT_BASE
+    global MAX_INVENTORY_HOLD_NS, MAX_POSITION_BASE, MAX_GROSS_POSITION_BASE
+    global TARGET_BITMEX_BUY_FILLS, TARGET_BITMEX_SELL_FILLS, FILL_BALANCE_WINDOW_NS
+    global MAX_WINDOW_BITMEX_MAKER_FILLS, MAX_SIDE_OVERFILL
+    global FILL_BALANCE_SKEW_BPS, MAX_FILL_BALANCE_SKEW_BPS
     args = parse_args()
     DATE = args.date
     END_CLOSE_TS_NS = day_end_ns(DATE)
+    BASE_BID_SPREAD_RATIO = args.base_bid_spread_bps / 10_000.0
+    BASE_ASK_SPREAD_RATIO = args.base_ask_spread_bps / 10_000.0
+    INVENTORY_SKEW_BPS = args.inventory_skew_bps
+    MAX_REDUCE_QUOTE_CROSS_BPS = args.max_reduce_cross_bps
+    SOFT_INVENTORY_LIMIT_BASE = args.soft_inventory_base
+    HARD_INVENTORY_LIMIT_BASE = args.hard_inventory_base
+    MAX_INVENTORY_HOLD_NS = int(args.max_hold_ms * 1_000_000.0)
+    MAX_POSITION_BASE = args.max_position_base
+    MAX_GROSS_POSITION_BASE = args.max_gross_base
+    TARGET_BITMEX_BUY_FILLS = args.target_buy_fills
+    TARGET_BITMEX_SELL_FILLS = args.target_sell_fills
+    FILL_BALANCE_WINDOW_NS = int(args.fill_window_min * 60_000_000_000.0)
+    MAX_WINDOW_BITMEX_MAKER_FILLS = args.max_window_fills
+    MAX_SIDE_OVERFILL = args.max_side_overfill
+    FILL_BALANCE_SKEW_BPS = args.fill_balance_skew_bps
+    MAX_FILL_BALANCE_SKEW_BPS = args.max_fill_balance_skew_bps
 
     NPZ_DIR.mkdir(parents=True, exist_ok=True)
     RESULT_DIR.mkdir(parents=True, exist_ok=True)

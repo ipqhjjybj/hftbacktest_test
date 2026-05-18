@@ -1,8 +1,10 @@
+import argparse
 import gzip
 import json
 import math
 import os
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +29,7 @@ from hftbacktest.data.utils import tardis
 
 
 DATE = "20260513"
+DEFAULT_DATES = ("20260512", "20260513", "20260514")
 
 BITMEX_EXCHANGE = "bitmex"
 BITMEX_SYMBOL = "XBTUSD"
@@ -48,6 +51,12 @@ BITMEX_ORDER_ENTRY_LATENCY_NS = 80_000_000
 BITMEX_ORDER_RESPONSE_LATENCY_NS = 80_000_000
 GATE_ORDER_ENTRY_LATENCY_NS = 20_000_000
 GATE_ORDER_RESPONSE_LATENCY_NS = 20_000_000
+GATE_SHORT_MOMENTUM_WINDOW_NS = 100_000_000
+GATE_MOMENTUM_CANCEL_BPS = 1.0
+GATE_MICROPRICE_CANCEL_BPS = 0.5
+TOXIC_FILL_GATE_ANCHOR_MOVE_BPS = 1.5
+TOXIC_FILL_COOLDOWN_NS = 1_000_000_000
+GATE_SIGNAL_HISTORY_LEN = 4096
 
 BITMEX_TICK_SIZE = 0.5
 BITMEX_LOT_SIZE = 100.0
@@ -95,6 +104,12 @@ def csv_path(exchange: str, data_type: str, symbol: str, yyyymmdd: str) -> Path:
 
 def npz_path(exchange: str, symbol: str, yyyymmdd: str) -> Path:
     return NPZ_DIR / f"{exchange}_{symbol}_{yyyymmdd}.npz"
+
+
+def end_close_ts_ns(yyyymmdd: str) -> int:
+    dt = datetime.strptime(yyyymmdd, "%Y%m%d").replace(tzinfo=timezone.utc)
+    end = dt + timedelta(days=1) - timedelta(seconds=60)
+    return int(end.timestamp() * 1_000_000_000)
 
 
 def download_file(exchange: str, data_type: str, symbol: str, yyyymmdd: str, key: str) -> Path:
@@ -329,6 +344,104 @@ def dynamic_spreads(hbt):
 
 
 @njit
+def ratio_minus_one_bps(numerator, denominator):
+    if not math.isfinite(numerator) or not math.isfinite(denominator) or denominator <= 0:
+        return math.nan
+    return (numerator / denominator - 1.0) * 10_000.0
+
+
+@njit
+def record_gate_signal(
+    hbt,
+    gate_signal_ts,
+    gate_signal_bid,
+    gate_signal_ask,
+    gate_signal_bid_qty,
+    gate_signal_ask_qty,
+    gate_signal_write_idx,
+    gate_signal_count,
+):
+    gate_depth = hbt.depth(1)
+    if gate_depth.best_bid <= 0 or gate_depth.best_ask <= 0:
+        return gate_signal_write_idx, gate_signal_count
+    gate_signal_ts[gate_signal_write_idx] = hbt.current_timestamp
+    gate_signal_bid[gate_signal_write_idx] = gate_depth.best_bid
+    gate_signal_ask[gate_signal_write_idx] = gate_depth.best_ask
+    gate_signal_bid_qty[gate_signal_write_idx] = gate_depth.best_bid_qty
+    gate_signal_ask_qty[gate_signal_write_idx] = gate_depth.best_ask_qty
+    gate_signal_write_idx = (gate_signal_write_idx + 1) % GATE_SIGNAL_HISTORY_LEN
+    gate_signal_count = min(gate_signal_count + 1, GATE_SIGNAL_HISTORY_LEN)
+    return gate_signal_write_idx, gate_signal_count
+
+
+@njit
+def gate_signal_at_or_before(
+    gate_signal_ts,
+    gate_signal_write_idx,
+    gate_signal_count,
+    target_ts,
+):
+    for offset in range(gate_signal_count):
+        idx = (gate_signal_write_idx - 1 - offset) % GATE_SIGNAL_HISTORY_LEN
+        if gate_signal_ts[idx] <= target_ts:
+            return idx
+    return -1
+
+
+@njit
+def gate_toxic_quote_signal(
+    side,
+    gate_signal_ts,
+    gate_signal_bid,
+    gate_signal_ask,
+    gate_signal_bid_qty,
+    gate_signal_ask_qty,
+    gate_signal_write_idx,
+    gate_signal_count,
+):
+    if gate_signal_count <= 1:
+        return False, 0.0, 0.0
+    current_idx = (gate_signal_write_idx - 1) % GATE_SIGNAL_HISTORY_LEN
+
+    if GATE_MOMENTUM_CANCEL_BPS > 0 and GATE_SHORT_MOMENTUM_WINDOW_NS > 0:
+        target_ts = gate_signal_ts[current_idx] - GATE_SHORT_MOMENTUM_WINDOW_NS
+        past_idx = gate_signal_at_or_before(
+            gate_signal_ts,
+            gate_signal_write_idx,
+            gate_signal_count,
+            target_ts,
+        )
+        if past_idx >= 0:
+            if side > 0:
+                move_bps = ratio_minus_one_bps(gate_signal_bid[current_idx], gate_signal_bid[past_idx])
+                adverse_bps = -move_bps
+            else:
+                move_bps = ratio_minus_one_bps(gate_signal_ask[current_idx], gate_signal_ask[past_idx])
+                adverse_bps = move_bps
+            if adverse_bps >= GATE_MOMENTUM_CANCEL_BPS:
+                return True, move_bps, 1.0
+
+    if GATE_MICROPRICE_CANCEL_BPS > 0:
+        total_qty = gate_signal_bid_qty[current_idx] + gate_signal_ask_qty[current_idx]
+        if total_qty > 0:
+            bid = gate_signal_bid[current_idx]
+            ask = gate_signal_ask[current_idx]
+            mid = (bid + ask) / 2.0
+            microprice = (
+                ask * gate_signal_bid_qty[current_idx] + bid * gate_signal_ask_qty[current_idx]
+            ) / total_qty
+            micro_bps = ratio_minus_one_bps(microprice, mid)
+            if side > 0:
+                adverse_bps = -micro_bps
+            else:
+                adverse_bps = micro_bps
+            if adverse_bps >= GATE_MICROPRICE_CANCEL_BPS:
+                return True, micro_bps, 2.0
+
+    return False, 0.0, 0.0
+
+
+@njit
 def cancel_all_side(hbt, asset_no, side):
     orders = hbt.orders(asset_no)
     values = orders.values()
@@ -349,19 +462,34 @@ def cancel_all_orders(hbt, asset_no):
 
 
 @njit
-def manage_bitmex_bid(hbt, order_id, inflight_until):
+def manage_bitmex_bid(
+    hbt,
+    order_id,
+    inflight_until,
+    quote_gate_anchor,
+    toxic_enabled,
+    toxic_bid_cooldown_until,
+    gate_signal_ts,
+    gate_signal_bid,
+    gate_signal_ask,
+    gate_signal_bid_qty,
+    gate_signal_ask_qty,
+    gate_signal_write_idx,
+    gate_signal_count,
+    metrics,
+):
     if hbt.current_timestamp < inflight_until:
-        return order_id, inflight_until
+        return order_id, inflight_until, quote_gate_anchor
 
     bitmex_depth = hbt.depth(0)
     gate_depth = hbt.depth(1)
 
     if bitmex_depth.best_bid <= 0 or bitmex_depth.best_ask <= 0:
         cancel_all_side(hbt, 0, 1)
-        return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
+        return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, quote_gate_anchor
     if gate_depth.best_bid <= 0 or gate_depth.best_ask <= 0:
         cancel_all_side(hbt, 0, 1)
-        return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
+        return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, quote_gate_anchor
 
     base_pos = current_bitmex_base(hbt)
     bitmex_mid = (bitmex_depth.best_bid + bitmex_depth.best_ask) / 2.0
@@ -374,6 +502,36 @@ def manage_bitmex_bid(hbt, order_id, inflight_until):
     bid_qty = BITMEX_ORDER_QTY
 
     existing = hbt.orders(0).get(order_id)
+    if toxic_enabled:
+        if hbt.current_timestamp < toxic_bid_cooldown_until:
+            if existing is not None and existing.cancellable:
+                hbt.cancel(0, order_id, False)
+                metrics[25] += 1
+                return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, quote_gate_anchor
+            metrics[29] += 1
+            return order_id, inflight_until, quote_gate_anchor
+        signal, signal_bps, signal_code = gate_toxic_quote_signal(
+            1.0,
+            gate_signal_ts,
+            gate_signal_bid,
+            gate_signal_ask,
+            gate_signal_bid_qty,
+            gate_signal_ask_qty,
+            gate_signal_write_idx,
+            gate_signal_count,
+        )
+        if signal:
+            metrics[22] += 1
+            if signal_code == 1.0:
+                metrics[32] += 1
+            else:
+                metrics[34] += 1
+            if existing is not None and existing.cancellable:
+                hbt.cancel(0, order_id, False)
+                metrics[23] += 1
+                return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, quote_gate_anchor
+            return order_id, inflight_until, quote_gate_anchor
+
     should_quote = (
         (base_pos < 0 or base_pos + order_base <= effective_max_base)
         and bid_qty >= BITMEX_LOT_SIZE
@@ -382,33 +540,48 @@ def manage_bitmex_bid(hbt, order_id, inflight_until):
     if not should_quote:
         if existing is not None and existing.cancellable:
             hbt.cancel(0, order_id, False)
-            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
-        return order_id, inflight_until
+            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, quote_gate_anchor
+        return order_id, inflight_until, quote_gate_anchor
 
     if existing is not None:
         if existing.cancellable and (existing.price != bid_price or existing.qty != bid_qty):
             hbt.modify(0, order_id, bid_price, bid_qty, False)
-            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
-        return order_id, inflight_until
+            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, gate_depth.best_bid
+        return order_id, inflight_until, quote_gate_anchor
 
     hbt.submit_buy_order(0, order_id, bid_price, bid_qty, GTX, LIMIT, False)
-    return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
+    return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, gate_depth.best_bid
 
 
 @njit
-def manage_bitmex_ask(hbt, order_id, inflight_until):
+def manage_bitmex_ask(
+    hbt,
+    order_id,
+    inflight_until,
+    quote_gate_anchor,
+    toxic_enabled,
+    toxic_ask_cooldown_until,
+    gate_signal_ts,
+    gate_signal_bid,
+    gate_signal_ask,
+    gate_signal_bid_qty,
+    gate_signal_ask_qty,
+    gate_signal_write_idx,
+    gate_signal_count,
+    metrics,
+):
     if hbt.current_timestamp < inflight_until:
-        return order_id, inflight_until
+        return order_id, inflight_until, quote_gate_anchor
 
     bitmex_depth = hbt.depth(0)
     gate_depth = hbt.depth(1)
 
     if bitmex_depth.best_bid <= 0 or bitmex_depth.best_ask <= 0:
         cancel_all_side(hbt, 0, -1)
-        return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
+        return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, quote_gate_anchor
     if gate_depth.best_bid <= 0 or gate_depth.best_ask <= 0:
         cancel_all_side(hbt, 0, -1)
-        return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
+        return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, quote_gate_anchor
 
     base_pos = current_bitmex_base(hbt)
     bitmex_mid = (bitmex_depth.best_bid + bitmex_depth.best_ask) / 2.0
@@ -421,6 +594,36 @@ def manage_bitmex_ask(hbt, order_id, inflight_until):
     ask_qty = BITMEX_ORDER_QTY
 
     existing = hbt.orders(0).get(order_id)
+    if toxic_enabled:
+        if hbt.current_timestamp < toxic_ask_cooldown_until:
+            if existing is not None and existing.cancellable:
+                hbt.cancel(0, order_id, False)
+                metrics[26] += 1
+                return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, quote_gate_anchor
+            metrics[30] += 1
+            return order_id, inflight_until, quote_gate_anchor
+        signal, signal_bps, signal_code = gate_toxic_quote_signal(
+            -1.0,
+            gate_signal_ts,
+            gate_signal_bid,
+            gate_signal_ask,
+            gate_signal_bid_qty,
+            gate_signal_ask_qty,
+            gate_signal_write_idx,
+            gate_signal_count,
+        )
+        if signal:
+            metrics[22] += 1
+            if signal_code == 1.0:
+                metrics[33] += 1
+            else:
+                metrics[35] += 1
+            if existing is not None and existing.cancellable:
+                hbt.cancel(0, order_id, False)
+                metrics[24] += 1
+                return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, quote_gate_anchor
+            return order_id, inflight_until, quote_gate_anchor
+
     should_quote = (
         (base_pos > 0 or base_pos - order_base >= -effective_max_base)
         and ask_qty >= BITMEX_LOT_SIZE
@@ -429,17 +632,17 @@ def manage_bitmex_ask(hbt, order_id, inflight_until):
     if not should_quote:
         if existing is not None and existing.cancellable:
             hbt.cancel(0, order_id, False)
-            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
-        return order_id, inflight_until
+            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, quote_gate_anchor
+        return order_id, inflight_until, quote_gate_anchor
 
     if existing is not None:
         if existing.cancellable and (existing.price != ask_price or existing.qty != ask_qty):
             hbt.modify(0, order_id, ask_price, ask_qty, False)
-            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
-        return order_id, inflight_until
+            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, gate_depth.best_ask
+        return order_id, inflight_until, quote_gate_anchor
 
     hbt.submit_sell_order(0, order_id, ask_price, ask_qty, GTX, LIMIT, False)
-    return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS
+    return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, gate_depth.best_ask
 
 
 @njit
@@ -578,12 +781,14 @@ def force_flatten(hbt, metrics):
 
 
 @njit
-def run_strategy(hbt, recorder, metrics):
+def run_strategy(hbt, recorder, metrics, toxic_enabled, end_close_ts_ns):
     bitmex_bid_order_id = 10_000
     bitmex_ask_order_id = 20_000
     gate_hedge_order_id = 30_000
     bitmex_bid_inflight_until = 0
     bitmex_ask_inflight_until = 0
+    bitmex_bid_gate_anchor = 0.0
+    bitmex_ask_gate_anchor = 0.0
     gate_hedge_inflight_until = 0
     pending_gate_hedge_due_ts = 0
     pending_gate_hedge_start_ts = 0
@@ -593,17 +798,62 @@ def run_strategy(hbt, recorder, metrics):
     last_bitmex_pos = hbt.position(0)
     last_bitmex_trades = hbt.state_values(0).num_trades
     last_bitmex_trading_value = hbt.state_values(0).trading_value
+    toxic_bid_cooldown_until = 0
+    toxic_ask_cooldown_until = 0
+    gate_signal_ts = np.zeros(GATE_SIGNAL_HISTORY_LEN, dtype=np.int64)
+    gate_signal_bid = np.zeros(GATE_SIGNAL_HISTORY_LEN, dtype=np.float64)
+    gate_signal_ask = np.zeros(GATE_SIGNAL_HISTORY_LEN, dtype=np.float64)
+    gate_signal_bid_qty = np.zeros(GATE_SIGNAL_HISTORY_LEN, dtype=np.float64)
+    gate_signal_ask_qty = np.zeros(GATE_SIGNAL_HISTORY_LEN, dtype=np.float64)
+    gate_signal_write_idx = 0
+    gate_signal_count = 0
 
     while hbt.elapse(ORDER_UPDATE_INTERVAL_NS) == 0:
-        if hbt.current_timestamp >= END_CLOSE_TS_NS:
+        if hbt.current_timestamp >= end_close_ts_ns:
             break
 
         hbt.clear_inactive_orders(ALL_ASSETS)
-        bitmex_bid_order_id, bitmex_bid_inflight_until = manage_bitmex_bid(
-            hbt, bitmex_bid_order_id, bitmex_bid_inflight_until
+        gate_signal_write_idx, gate_signal_count = record_gate_signal(
+            hbt,
+            gate_signal_ts,
+            gate_signal_bid,
+            gate_signal_ask,
+            gate_signal_bid_qty,
+            gate_signal_ask_qty,
+            gate_signal_write_idx,
+            gate_signal_count,
         )
-        bitmex_ask_order_id, bitmex_ask_inflight_until = manage_bitmex_ask(
-            hbt, bitmex_ask_order_id, bitmex_ask_inflight_until
+        bitmex_bid_order_id, bitmex_bid_inflight_until, bitmex_bid_gate_anchor = manage_bitmex_bid(
+            hbt,
+            bitmex_bid_order_id,
+            bitmex_bid_inflight_until,
+            bitmex_bid_gate_anchor,
+            toxic_enabled,
+            toxic_bid_cooldown_until,
+            gate_signal_ts,
+            gate_signal_bid,
+            gate_signal_ask,
+            gate_signal_bid_qty,
+            gate_signal_ask_qty,
+            gate_signal_write_idx,
+            gate_signal_count,
+            metrics,
+        )
+        bitmex_ask_order_id, bitmex_ask_inflight_until, bitmex_ask_gate_anchor = manage_bitmex_ask(
+            hbt,
+            bitmex_ask_order_id,
+            bitmex_ask_inflight_until,
+            bitmex_ask_gate_anchor,
+            toxic_enabled,
+            toxic_ask_cooldown_until,
+            gate_signal_ts,
+            gate_signal_bid,
+            gate_signal_ask,
+            gate_signal_bid_qty,
+            gate_signal_ask_qty,
+            gate_signal_write_idx,
+            gate_signal_count,
+            metrics,
         )
 
         bitmex_state = hbt.state_values(0)
@@ -621,6 +871,27 @@ def run_strategy(hbt, recorder, metrics):
                 metrics[11] += bitmex_state.num_trades - last_bitmex_trades
             elif delta_contracts < 0:
                 metrics[12] += bitmex_state.num_trades - last_bitmex_trades
+            if toxic_enabled:
+                gate_depth = hbt.depth(1)
+                adverse_anchor_move_bps = 0.0
+                if delta_contracts > 0 and bitmex_bid_gate_anchor > 0 and gate_depth.best_bid > 0:
+                    adverse_anchor_move_bps = -ratio_minus_one_bps(gate_depth.best_bid, bitmex_bid_gate_anchor)
+                    if adverse_anchor_move_bps >= TOXIC_FILL_GATE_ANCHOR_MOVE_BPS:
+                        toxic_bid_cooldown_until = max(
+                            toxic_bid_cooldown_until,
+                            hbt.current_timestamp + TOXIC_FILL_COOLDOWN_NS,
+                        )
+                        metrics[27] += 1
+                        metrics[28] += adverse_anchor_move_bps
+                elif delta_contracts < 0 and bitmex_ask_gate_anchor > 0 and gate_depth.best_ask > 0:
+                    adverse_anchor_move_bps = ratio_minus_one_bps(gate_depth.best_ask, bitmex_ask_gate_anchor)
+                    if adverse_anchor_move_bps >= TOXIC_FILL_GATE_ANCHOR_MOVE_BPS:
+                        toxic_ask_cooldown_until = max(
+                            toxic_ask_cooldown_until,
+                            hbt.current_timestamp + TOXIC_FILL_COOLDOWN_NS,
+                        )
+                        metrics[27] += 1
+                        metrics[28] += adverse_anchor_move_bps
             last_bitmex_pos = bitmex_state.position
             last_bitmex_trades = bitmex_state.num_trades
             last_bitmex_trading_value = bitmex_state.trading_value
@@ -672,7 +943,7 @@ def run_strategy(hbt, recorder, metrics):
     return True
 
 
-def run_backtest(bitmex_npz: Path, gate_npz: Path) -> Path:
+def run_backtest(bitmex_npz: Path, gate_npz: Path, yyyymmdd: str, mode: str) -> Path:
     bitmex_asset = (
         BacktestAsset()
         .data([str(bitmex_npz)])
@@ -700,18 +971,26 @@ def run_backtest(bitmex_npz: Path, gate_npz: Path) -> Path:
 
     hbt = HashMapMarketDepthBacktest([bitmex_asset, gate_asset])
     recorder = Recorder(2, 100_000)
-    metrics = np.zeros(32, dtype=np.float64)
-    ok = run_strategy(hbt, recorder.recorder, metrics)
+    metrics = np.zeros(40, dtype=np.float64)
+    toxic_enabled = mode == "toxic"
+    metrics[31] = 1.0 if toxic_enabled else 0.0
+    end_ts_ns = end_close_ts_ns(yyyymmdd)
+    ok = run_strategy(hbt, recorder.recorder, metrics, toxic_enabled, end_ts_ns)
     if not ok:
         raise RuntimeError("strategy returned false")
 
-    out = RESULT_DIR / f"bitmex_xbtusd_gate_btc_usdt_mm_arb_{DATE}.npz"
+    out = RESULT_DIR / f"bitmex_xbtusd_gate_btc_usdt_mm_arb_{mode}_{yyyymmdd}.npz"
     np.savez_compressed(out, **{"0": recorder.get(0), "1": recorder.get(1), "metrics": metrics})
-    write_summary(out, metrics)
+    write_summary(out, metrics, yyyymmdd, mode)
     return out
 
 
-def write_summary(result_npz: Path, metrics: np.ndarray | None = None) -> None:
+def write_summary(
+    result_npz: Path,
+    metrics: np.ndarray | None = None,
+    yyyymmdd: str = DATE,
+    mode: str = "baseline",
+) -> None:
     data = np.load(result_npz)
     bitmex = data["0"]
     gate = data["1"]
@@ -742,13 +1021,16 @@ def write_summary(result_npz: Path, metrics: np.ndarray | None = None) -> None:
     avg_paired_edge = metrics[14] / metrics[15] if metrics[15] > 0 else 0.0
     avg_buy_paired_edge = metrics[16] / metrics[17] if metrics[17] > 0 else 0.0
     avg_sell_paired_edge = metrics[18] / metrics[19] if metrics[19] > 0 else 0.0
+    avg_toxic_anchor_move_bps = metrics[28] / metrics[27] if metrics[27] > 0 else 0.0
     total_pnl_usdt = combined_equity_usdt
     pnl_status = "profit" if total_pnl_usdt > 0 else "loss" if total_pnl_usdt < 0 else "flat"
     pnl_status_zh = "赚钱" if total_pnl_usdt > 0 else "亏钱" if total_pnl_usdt < 0 else "不赚不亏"
     final_flat = abs(bitmex_base) < 1e-12 and abs(gate_base) < 1e-12
 
     summary = {
-        "date": DATE,
+        "date": yyyymmdd,
+        "mode": mode,
+        "toxic_filter_enabled": bool(metrics[31] > 0),
         "bitmex_symbol": BITMEX_SYMBOL,
         "gate_symbol": GATE_SYMBOL,
         "open_long_spread_ratio": OPEN_LONG_SPREAD_RATIO,
@@ -767,6 +1049,11 @@ def write_summary(result_npz: Path, metrics: np.ndarray | None = None) -> None:
         "local_gate_send_delay_ms": LOCAL_GATE_SEND_DELAY_NS / 1_000_000.0,
         "gate_hedge_send_delay_ms": GATE_HEDGE_SEND_DELAY_NS / 1_000_000.0,
         "gate_hedge_inflight_ms": GATE_HEDGE_INFLIGHT_NS / 1_000_000.0,
+        "gate_short_momentum_window_ms": GATE_SHORT_MOMENTUM_WINDOW_NS / 1_000_000.0,
+        "gate_momentum_cancel_bps": GATE_MOMENTUM_CANCEL_BPS,
+        "gate_microprice_cancel_bps": GATE_MICROPRICE_CANCEL_BPS,
+        "toxic_fill_gate_anchor_move_bps": TOXIC_FILL_GATE_ANCHOR_MOVE_BPS,
+        "toxic_fill_cooldown_ms": TOXIC_FILL_COOLDOWN_NS / 1_000_000.0,
         "bitmex_tick_size": BITMEX_TICK_SIZE,
         "gate_tick_size": GATE_TICK_SIZE,
         "bitmex_order_entry_latency_ms": BITMEX_ORDER_ENTRY_LATENCY_NS / 1_000_000.0,
@@ -777,6 +1064,19 @@ def write_summary(result_npz: Path, metrics: np.ndarray | None = None) -> None:
         "gate_queue_model": "power_prob_queue_model3(3.0)",
         "bitmex_fill_hedge_enqueue_events": int(metrics[20]),
         "gate_hedge_send_events": int(metrics[21]),
+        "toxic_quote_signal_events": int(metrics[22]),
+        "toxic_bid_signal_cancel_events": int(metrics[23]),
+        "toxic_ask_signal_cancel_events": int(metrics[24]),
+        "toxic_bid_cooldown_cancel_events": int(metrics[25]),
+        "toxic_ask_cooldown_cancel_events": int(metrics[26]),
+        "toxic_fill_events": int(metrics[27]),
+        "avg_toxic_anchor_move_bps": float(avg_toxic_anchor_move_bps),
+        "toxic_bid_cooldown_suppress_events": int(metrics[29]),
+        "toxic_ask_cooldown_suppress_events": int(metrics[30]),
+        "toxic_bid_momentum_signal_events": int(metrics[32]),
+        "toxic_ask_momentum_signal_events": int(metrics[33]),
+        "toxic_bid_microprice_signal_events": int(metrics[34]),
+        "toxic_ask_microprice_signal_events": int(metrics[35]),
         "pnl_status": pnl_status,
         "pnl_status_zh": pnl_status_zh,
         "total_pnl_usdt": total_pnl_usdt,
@@ -843,6 +1143,7 @@ def render_console_summary(summary: dict) -> str:
         "========== 回测结果 ==========",
         f"结论: {summary['pnl_status_zh']} ({signed_money(summary['total_pnl_usdt'])})",
         f"日期: {summary['date']}",
+        f"模式: {summary['mode']} (toxic_filter={summary['toxic_filter_enabled']})",
         f"交易对: BitMEX {summary['bitmex_symbol']} maker vs Gate {summary['gate_symbol']} taker",
         f"最终仓位归零: {'是' if summary['final_flat'] else '否'}",
         f"总成交 base: {summary['total_filled_base']:,.8f} BTC",
@@ -850,6 +1151,9 @@ def render_console_summary(summary: dict) -> str:
         f"  买成交: {summary['bitmex_buy_fills']}, 卖成交: {summary['bitmex_sell_fills']}",
         f"Gate hedge 成交次数: {summary['gate_hedge_fills']}",
         f"Gate hedge 发送事件: {summary['gate_hedge_send_events']}",
+        f"Toxic fill: {summary['toxic_fill_events']}, avg anchor move: {summary['avg_toxic_anchor_move_bps']:,.4f} bps",
+        f"Toxic signal cancel: bid={summary['toxic_bid_signal_cancel_events']}, ask={summary['toxic_ask_signal_cancel_events']}",
+        f"Toxic cooldown suppress: bid={summary['toxic_bid_cooldown_suppress_events']}, ask={summary['toxic_ask_cooldown_suppress_events']}",
         f"平均 hedge 延迟: {summary['avg_hedge_delay_ms']:,.4f} ms",
         f"实际配对边际: {signed_money(summary['paired_edge_pnl_usdt'])}",
         f"平均配对边际: {summary['avg_paired_edge_usdt_per_btc']:,.4f} USDT/BTC",
@@ -877,6 +1181,8 @@ def render_report(summary: dict) -> str:
 ## 参数
 
 - 日期: `{summary['date']}`
+- 模式: `{summary['mode']}`
+- Toxic filter enabled: `{summary['toxic_filter_enabled']}`
 - BitMEX maker: `{summary['bitmex_symbol']}`
 - Gate hedge: `{summary['gate_symbol']}`
 - `OPEN_LONG_SPREAD_RATIO`: `{summary['open_long_spread_ratio']}`
@@ -895,6 +1201,11 @@ def render_report(summary: dict) -> str:
 - BitMEX fill report delay: `{summary['bitmex_fill_report_delay_ms']} ms`
 - Local Gate send delay: `{summary['local_gate_send_delay_ms']} ms`
 - Gate hedge inflight: `{summary['gate_hedge_inflight_ms']} ms`
+- Gate short momentum window: `{summary['gate_short_momentum_window_ms']} ms`
+- Gate momentum cancel: `{summary['gate_momentum_cancel_bps']} bps`
+- Gate microprice cancel: `{summary['gate_microprice_cancel_bps']} bps`
+- Toxic fill anchor move: `{summary['toxic_fill_gate_anchor_move_bps']} bps`
+- Toxic fill cooldown: `{summary['toxic_fill_cooldown_ms']} ms`
 - BitMEX tick size: `{summary['bitmex_tick_size']}`
 - Gate tick size: `{summary['gate_tick_size']}`
 - BitMEX order latency: `{summary['bitmex_order_entry_latency_ms']} ms entry`, `{summary['bitmex_order_response_latency_ms']} ms response`
@@ -922,6 +1233,15 @@ def render_report(summary: dict) -> str:
 - Gate hedge 成交次数: `{summary['gate_hedge_fills']}`
 - BitMEX fill hedge enqueue events: `{summary['bitmex_fill_hedge_enqueue_events']}`
 - Gate hedge send events: `{summary['gate_hedge_send_events']}`
+- Toxic quote signal events: `{summary['toxic_quote_signal_events']}`
+- Toxic bid signal cancel events: `{summary['toxic_bid_signal_cancel_events']}`
+- Toxic ask signal cancel events: `{summary['toxic_ask_signal_cancel_events']}`
+- Toxic bid cooldown cancel events: `{summary['toxic_bid_cooldown_cancel_events']}`
+- Toxic ask cooldown cancel events: `{summary['toxic_ask_cooldown_cancel_events']}`
+- Toxic fill events: `{summary['toxic_fill_events']}`
+- Avg toxic anchor move: `{summary['avg_toxic_anchor_move_bps']:,.4f} bps`
+- Toxic bid cooldown suppress events: `{summary['toxic_bid_cooldown_suppress_events']}`
+- Toxic ask cooldown suppress events: `{summary['toxic_ask_cooldown_suppress_events']}`
 - 实际配对边际 PnL: `{signed_money(summary['paired_edge_pnl_usdt'])}`
 - 平均实际配对边际: `{summary['avg_paired_edge_usdt_per_btc']:,.4f} USDT/BTC`
 - BitMEX 买 -> Gate 卖平均边际: `{summary['avg_bitmex_buy_then_gate_sell_edge_usdt_per_btc']:,.4f} USDT/BTC`
@@ -942,23 +1262,61 @@ def render_report(summary: dict) -> str:
 """
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Backtest BitMEX maker / Gate taker arbitrage with optional toxic filters."
+    )
+    parser.add_argument(
+        "--dates",
+        nargs="+",
+        default=list(DEFAULT_DATES),
+        help="Dates as YYYYMMDD. Default: 20260512 20260513 20260514.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["baseline", "toxic", "both"],
+        default="both",
+        help="Run baseline, toxic-filter, or both modes.",
+    )
+    parser.add_argument(
+        "--skip-download",
+        action="store_true",
+        help="Use existing csv/npz files and do not download missing Tardis CSVs.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     CSV_DIR.mkdir(parents=True, exist_ok=True)
     NPZ_DIR.mkdir(parents=True, exist_ok=True)
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
-    key = tardis_key()
-    for exchange, symbol in ((BITMEX_EXCHANGE, BITMEX_SYMBOL), (GATE_EXCHANGE, GATE_SYMBOL)):
-        data_types = ("trades", "incremental_book_L2")
-        if exchange == GATE_EXCHANGE:
-            data_types = ("trades", "book_ticker")
-        for data_type in data_types:
-            download_file(exchange, data_type, symbol, DATE, key)
+    modes = ("baseline", "toxic") if args.mode == "both" else (args.mode,)
+    key = None if args.skip_download else tardis_key()
+    results = []
+    for yyyymmdd in args.dates:
+        for exchange, symbol in ((BITMEX_EXCHANGE, BITMEX_SYMBOL), (GATE_EXCHANGE, GATE_SYMBOL)):
+            data_types = ("trades", "incremental_book_L2")
+            if exchange == GATE_EXCHANGE:
+                data_types = ("trades", "book_ticker")
+            for data_type in data_types:
+                path = csv_path(exchange, data_type, symbol, yyyymmdd)
+                if args.skip_download:
+                    if not path.exists():
+                        raise FileNotFoundError(f"missing {path}; rerun without --skip-download")
+                    print(f"exists {path}")
+                else:
+                    download_file(exchange, data_type, symbol, yyyymmdd, key)
 
-    bitmex_npz = convert_pair(BITMEX_EXCHANGE, BITMEX_SYMBOL, DATE)
-    gate_npz = convert_pair(GATE_EXCHANGE, GATE_SYMBOL, DATE)
-    result = run_backtest(bitmex_npz, gate_npz)
-    print(f"result={result}")
+        bitmex_npz = convert_pair(BITMEX_EXCHANGE, BITMEX_SYMBOL, yyyymmdd)
+        gate_npz = convert_pair(GATE_EXCHANGE, GATE_SYMBOL, yyyymmdd)
+        for mode in modes:
+            result = run_backtest(bitmex_npz, gate_npz, yyyymmdd, mode)
+            results.append(result)
+            print(f"result={result}")
+
+    print("all_results=" + ",".join(str(path) for path in results))
 
 
 if __name__ == "__main__":
