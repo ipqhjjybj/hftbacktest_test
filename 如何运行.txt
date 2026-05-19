@@ -1,3 +1,11 @@
 
-.venv/bin/python scripts/sweep_bitmex_single_market_mm.py --dates 20260512 20260513 20260514 --half-spreads 2.6,2.8,3.0,3.2 --ttls-ms 100,150,200 --momentum-bps
-  │ 0.8 --microprice-bps 0.3,0.5 --vol-multipliers 0.5 --skip-existing --out results/bitmex_xbtusd_single_market_mm_sweep_refined.csv
+.venv/bin/python scripts/sweep_bitmex_single_market_mm.py \
+    --dates 20260512 20260513 20260514 \
+    --half-spreads 2.6,2.8,3.0,3.2 \
+    --ttls-ms 100,150,200 \
+    --momentum-bps 0.8 \
+    --microprice-bps 0.3,0.5 \
+    --vol-multipliers 0.5 \
+    --skip-existing \
+    --out results/bitmex_xbtusd_single_market_mm_sweep_refined.csv
+

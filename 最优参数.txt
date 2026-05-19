@@ -1,0 +1,10 @@
+1、单市场做市策略:
+
+  half_spread=3.0bps
+  ttl=200ms
+  momentum_cancel=0.8bps
+  microprice_cancel=0.3bps
+  vol_multiplier=0.5
+  inventory_skew=4.0bps
+
+这组参数在单市场做市策略中表现较好
