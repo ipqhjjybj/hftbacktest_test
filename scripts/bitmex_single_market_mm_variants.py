@@ -65,6 +65,8 @@ MAX_POSITION_CONTRACTS = 1_000.0
 SOFT_POSITION_CONTRACTS = 500.0
 ORDER_TTL_NS = 200_000_000
 ORDER_QTY = BITMEX_ORDER_QTY
+MAKER_FEE_RATE = 0.0
+TAKER_FEE_RATE = 0.0
 
 VOL_WINDOW_NS = 1_000_000_000
 VOL_SPREAD_MULTIPLIER = 0.5
@@ -602,7 +604,7 @@ def run_backtest(bitmex_npz: Path, yyyymmdd: str, strategy_mode: int) -> Path:
         .constant_order_latency(BITMEX_ORDER_ENTRY_LATENCY_NS, BITMEX_ORDER_RESPONSE_LATENCY_NS)
         .risk_adverse_queue_model()
         .no_partial_fill_exchange()
-        .trading_value_fee_model(0.0, 0.0)
+        .trading_value_fee_model(MAKER_FEE_RATE, TAKER_FEE_RATE)
         .tick_size(BITMEX_TICK_SIZE)
         .lot_size(BITMEX_LOT_SIZE)
         .last_trades_capacity(10_000)
@@ -648,6 +650,8 @@ def strategy_config(strategy_mode: int) -> dict:
         "soft_position_contracts": SOFT_POSITION_CONTRACTS,
         "order_qty_contracts": ORDER_QTY,
         "order_qty_base": ORDER_QTY * BITMEX_CONTRACT_SIZE,
+        "maker_fee_rate": MAKER_FEE_RATE,
+        "taker_fee_rate": TAKER_FEE_RATE,
         "order_ttl_ms": ORDER_TTL_NS / 1_000_000.0,
         "order_update_interval_ms": ORDER_UPDATE_INTERVAL_NS / 1_000_000.0,
         "command_inflight_ms": BITMEX_COMMAND_INFLIGHT_NS / 1_000_000.0,
@@ -844,6 +848,8 @@ def parse_args(strategy_mode: int) -> argparse.Namespace:
     parser.add_argument("--base-half-spread-bps", type=float, default=BASE_HALF_SPREAD_BPS)
     parser.add_argument("--min-half-spread-ticks", type=float, default=MIN_HALF_SPREAD_TICKS)
     parser.add_argument("--order-qty-contracts", type=float, default=ORDER_QTY)
+    parser.add_argument("--maker-fee-rate", type=float, default=MAKER_FEE_RATE)
+    parser.add_argument("--taker-fee-rate", type=float, default=TAKER_FEE_RATE)
     parser.add_argument("--order-ttl-ms", type=float, default=ORDER_TTL_NS / 1_000_000.0)
     parser.add_argument("--rest-min-interval-ms", type=float, default=BITMEX_REST_MIN_INTERVAL_NS / 1_000_000.0)
     parser.add_argument("--max-position-contracts", type=float, default=MAX_POSITION_CONTRACTS)
@@ -874,6 +880,8 @@ def apply_args(args: argparse.Namespace, strategy_mode: int) -> None:
     global BASE_HALF_SPREAD_BPS
     global MIN_HALF_SPREAD_TICKS
     global ORDER_QTY
+    global MAKER_FEE_RATE
+    global TAKER_FEE_RATE
     global ORDER_TTL_NS
     global BITMEX_REST_MIN_INTERVAL_NS
     global MAX_POSITION_CONTRACTS
@@ -895,6 +903,8 @@ def apply_args(args: argparse.Namespace, strategy_mode: int) -> None:
     BASE_HALF_SPREAD_BPS = args.base_half_spread_bps
     MIN_HALF_SPREAD_TICKS = args.min_half_spread_ticks
     ORDER_QTY = args.order_qty_contracts
+    MAKER_FEE_RATE = args.maker_fee_rate
+    TAKER_FEE_RATE = args.taker_fee_rate
     ORDER_TTL_NS = int(args.order_ttl_ms * 1_000_000)
     BITMEX_REST_MIN_INTERVAL_NS = int(args.rest_min_interval_ms * 1_000_000)
     MAX_POSITION_CONTRACTS = args.max_position_contracts
