@@ -25,31 +25,34 @@ from hftbacktest.data.utils import tardis
 DEFAULT_DATES = ("20260512", "20260513", "20260514")
 
 BITMEX_EXCHANGE = "bitmex"
-BITMEX_SYMBOL = "XBTUSD"
+BITMEX_SYMBOL = "XBTUSDT"
 
 BITMEX_TICK_SIZE = 0.5
 BITMEX_LOT_SIZE = 100.0
-BITMEX_CONTRACT_SIZE = 1.0
+# XBTUSDT linear sizing for this backtest:
+# 100 contracts = 0.0001 BTC, so 1 contract = 0.000001 BTC.
+BITMEX_CONTRACT_SIZE = 0.000001
 BITMEX_ORDER_QTY = 100.0
 
 ORDER_UPDATE_INTERVAL_NS = 10_000_000
 BITMEX_COMMAND_INFLIGHT_NS = 80_000_000
+BITMEX_REST_MIN_INTERVAL_NS = 350_000_000
 BITMEX_ORDER_ENTRY_LATENCY_NS = 80_000_000
 BITMEX_ORDER_RESPONSE_LATENCY_NS = 40_000_000
 
 # Single-market MM controls.
-BASE_HALF_SPREAD_BPS = 2.5
+BASE_HALF_SPREAD_BPS = 3.0
 MIN_HALF_SPREAD_TICKS = 1.0
 MAX_POSITION_CONTRACTS = 1_000.0
 SOFT_POSITION_CONTRACTS = 500.0
 INVENTORY_SKEW_BPS_AT_SOFT_LIMIT = 4.0
-ORDER_TTL_NS = 500_000_000
+ORDER_TTL_NS = 200_000_000
 
 # Quote toxicity filters.
 SIGNAL_HISTORY_LEN = 4096
 SHORT_MOMENTUM_WINDOW_NS = 100_000_000
-MOMENTUM_CANCEL_BPS = 1.0
-MICROPRICE_CANCEL_BPS = 0.5
+MOMENTUM_CANCEL_BPS = 0.8
+MICROPRICE_CANCEL_BPS = 0.3
 VOL_WINDOW_NS = 1_000_000_000
 VOL_SPREAD_MULTIPLIER = 0.5
 TOXIC_FILL_MID_MOVE_BPS = 1.5
@@ -167,9 +170,7 @@ def ratio_minus_one_bps(numerator, denominator):
 
 @njit
 def bitmex_base_from_contracts(contracts, price):
-    if price <= 0:
-        return 0.0
-    return contracts * BITMEX_CONTRACT_SIZE / price
+    return contracts * BITMEX_CONTRACT_SIZE
 
 
 @njit
@@ -177,8 +178,7 @@ def bitmex_equity_usdt(hbt):
     depth = hbt.depth(0)
     mid = (depth.best_bid + depth.best_ask) / 2.0
     state = hbt.state_values(0)
-    equity_btc = -state.balance - state.position * BITMEX_CONTRACT_SIZE / mid - state.fee
-    return equity_btc * mid
+    return state.balance + state.position * mid * BITMEX_CONTRACT_SIZE - state.fee
 
 
 @njit
@@ -306,6 +306,7 @@ def manage_bid(
     hbt,
     order_id,
     inflight_until,
+    next_rest_allowed_ts,
     live_since,
     anchor_mid,
     signal_ts,
@@ -318,22 +319,40 @@ def manage_bid(
     metrics,
 ):
     if hbt.current_timestamp < inflight_until:
-        return order_id, inflight_until, live_since, anchor_mid
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
 
     depth = hbt.depth(0)
     if depth.best_bid <= 0 or depth.best_ask <= 0:
+        if hbt.current_timestamp < next_rest_allowed_ts:
+            metrics[32] += 1
+            return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
         if cancel_order(hbt, order_id):
             metrics[16] += 1
-            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, 0, anchor_mid
-        return order_id, inflight_until, live_since, anchor_mid
+            return (
+                order_id,
+                hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS,
+                hbt.current_timestamp + BITMEX_REST_MIN_INTERVAL_NS,
+                0,
+                anchor_mid,
+            )
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
 
     existing = hbt.orders(0).get(order_id)
     if existing is not None and live_since > 0 and hbt.current_timestamp - live_since >= ORDER_TTL_NS:
         if existing.cancellable:
+            if hbt.current_timestamp < next_rest_allowed_ts:
+                metrics[32] += 1
+                return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
             hbt.cancel(0, order_id, False)
             metrics[8] += 1
-            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, 0, anchor_mid
-        return order_id, inflight_until, live_since, anchor_mid
+            return (
+                order_id,
+                hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS,
+                hbt.current_timestamp + BITMEX_REST_MIN_INTERVAL_NS,
+                0,
+                anchor_mid,
+            )
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
 
     is_toxic, value_bps, reason = toxic_signal(
         1,
@@ -352,20 +371,38 @@ def manage_bid(
         elif reason == 2.0:
             metrics[19] += 1
         if existing is not None and existing.cancellable:
+            if hbt.current_timestamp < next_rest_allowed_ts:
+                metrics[32] += 1
+                return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
             hbt.cancel(0, order_id, False)
             metrics[6] += 1
-            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, 0, anchor_mid
+            return (
+                order_id,
+                hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS,
+                hbt.current_timestamp + BITMEX_REST_MIN_INTERVAL_NS,
+                0,
+                anchor_mid,
+            )
         metrics[12] += 1
-        return order_id, inflight_until, live_since, anchor_mid
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
 
     pos = hbt.position(0)
     if pos + BITMEX_ORDER_QTY > MAX_POSITION_CONTRACTS:
         if existing is not None and existing.cancellable:
+            if hbt.current_timestamp < next_rest_allowed_ts:
+                metrics[32] += 1
+                return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
             hbt.cancel(0, order_id, False)
             metrics[14] += 1
-            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, 0, anchor_mid
+            return (
+                order_id,
+                hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS,
+                hbt.current_timestamp + BITMEX_REST_MIN_INTERVAL_NS,
+                0,
+                anchor_mid,
+            )
         metrics[20] += 1
-        return order_id, inflight_until, live_since, anchor_mid
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
 
     bid = depth.best_bid
     ask = depth.best_ask
@@ -386,18 +423,36 @@ def manage_bid(
     raw_bid = min(reservation * (1.0 - half_spread_bps / 10_000.0), depth.best_bid)
     bid_px = floor_to_tick(raw_bid, BITMEX_TICK_SIZE)
     if bid_px <= 0:
-        return order_id, inflight_until, live_since, anchor_mid
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
 
     if existing is not None:
         if existing.cancellable and (existing.price != bid_px or existing.qty != BITMEX_ORDER_QTY):
+            if hbt.current_timestamp < next_rest_allowed_ts:
+                metrics[32] += 1
+                return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
             hbt.modify(0, order_id, bid_px, BITMEX_ORDER_QTY, False)
             metrics[22] += 1
-            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, hbt.current_timestamp, mid
-        return order_id, inflight_until, live_since, anchor_mid
+            return (
+                order_id,
+                hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS,
+                hbt.current_timestamp + BITMEX_REST_MIN_INTERVAL_NS,
+                hbt.current_timestamp,
+                mid,
+            )
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
 
+    if hbt.current_timestamp < next_rest_allowed_ts:
+        metrics[32] += 1
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
     hbt.submit_buy_order(0, order_id, bid_px, BITMEX_ORDER_QTY, GTX, LIMIT, False)
     metrics[24] += 1
-    return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, hbt.current_timestamp, mid
+    return (
+        order_id,
+        hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS,
+        hbt.current_timestamp + BITMEX_REST_MIN_INTERVAL_NS,
+        hbt.current_timestamp,
+        mid,
+    )
 
 
 @njit
@@ -405,6 +460,7 @@ def manage_ask(
     hbt,
     order_id,
     inflight_until,
+    next_rest_allowed_ts,
     live_since,
     anchor_mid,
     signal_ts,
@@ -417,22 +473,40 @@ def manage_ask(
     metrics,
 ):
     if hbt.current_timestamp < inflight_until:
-        return order_id, inflight_until, live_since, anchor_mid
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
 
     depth = hbt.depth(0)
     if depth.best_bid <= 0 or depth.best_ask <= 0:
+        if hbt.current_timestamp < next_rest_allowed_ts:
+            metrics[33] += 1
+            return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
         if cancel_order(hbt, order_id):
             metrics[17] += 1
-            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, 0, anchor_mid
-        return order_id, inflight_until, live_since, anchor_mid
+            return (
+                order_id,
+                hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS,
+                hbt.current_timestamp + BITMEX_REST_MIN_INTERVAL_NS,
+                0,
+                anchor_mid,
+            )
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
 
     existing = hbt.orders(0).get(order_id)
     if existing is not None and live_since > 0 and hbt.current_timestamp - live_since >= ORDER_TTL_NS:
         if existing.cancellable:
+            if hbt.current_timestamp < next_rest_allowed_ts:
+                metrics[33] += 1
+                return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
             hbt.cancel(0, order_id, False)
             metrics[9] += 1
-            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, 0, anchor_mid
-        return order_id, inflight_until, live_since, anchor_mid
+            return (
+                order_id,
+                hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS,
+                hbt.current_timestamp + BITMEX_REST_MIN_INTERVAL_NS,
+                0,
+                anchor_mid,
+            )
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
 
     is_toxic, value_bps, reason = toxic_signal(
         -1,
@@ -451,20 +525,38 @@ def manage_ask(
         elif reason == 2.0:
             metrics[19] += 1
         if existing is not None and existing.cancellable:
+            if hbt.current_timestamp < next_rest_allowed_ts:
+                metrics[33] += 1
+                return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
             hbt.cancel(0, order_id, False)
             metrics[7] += 1
-            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, 0, anchor_mid
+            return (
+                order_id,
+                hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS,
+                hbt.current_timestamp + BITMEX_REST_MIN_INTERVAL_NS,
+                0,
+                anchor_mid,
+            )
         metrics[13] += 1
-        return order_id, inflight_until, live_since, anchor_mid
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
 
     pos = hbt.position(0)
     if pos - BITMEX_ORDER_QTY < -MAX_POSITION_CONTRACTS:
         if existing is not None and existing.cancellable:
+            if hbt.current_timestamp < next_rest_allowed_ts:
+                metrics[33] += 1
+                return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
             hbt.cancel(0, order_id, False)
             metrics[15] += 1
-            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, 0, anchor_mid
+            return (
+                order_id,
+                hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS,
+                hbt.current_timestamp + BITMEX_REST_MIN_INTERVAL_NS,
+                0,
+                anchor_mid,
+            )
         metrics[21] += 1
-        return order_id, inflight_until, live_since, anchor_mid
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
 
     bid = depth.best_bid
     ask = depth.best_ask
@@ -485,18 +577,36 @@ def manage_ask(
     raw_ask = max(reservation * (1.0 + half_spread_bps / 10_000.0), depth.best_ask)
     ask_px = ceil_to_tick(raw_ask, BITMEX_TICK_SIZE)
     if ask_px <= 0:
-        return order_id, inflight_until, live_since, anchor_mid
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
 
     if existing is not None:
         if existing.cancellable and (existing.price != ask_px or existing.qty != BITMEX_ORDER_QTY):
+            if hbt.current_timestamp < next_rest_allowed_ts:
+                metrics[33] += 1
+                return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
             hbt.modify(0, order_id, ask_px, BITMEX_ORDER_QTY, False)
             metrics[23] += 1
-            return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, hbt.current_timestamp, mid
-        return order_id, inflight_until, live_since, anchor_mid
+            return (
+                order_id,
+                hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS,
+                hbt.current_timestamp + BITMEX_REST_MIN_INTERVAL_NS,
+                hbt.current_timestamp,
+                mid,
+            )
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
 
+    if hbt.current_timestamp < next_rest_allowed_ts:
+        metrics[33] += 1
+        return order_id, inflight_until, next_rest_allowed_ts, live_since, anchor_mid
     hbt.submit_sell_order(0, order_id, ask_px, BITMEX_ORDER_QTY, GTX, LIMIT, False)
     metrics[25] += 1
-    return order_id, hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS, hbt.current_timestamp, mid
+    return (
+        order_id,
+        hbt.current_timestamp + BITMEX_COMMAND_INFLIGHT_NS,
+        hbt.current_timestamp + BITMEX_REST_MIN_INTERVAL_NS,
+        hbt.current_timestamp,
+        mid,
+    )
 
 
 @njit
@@ -546,6 +656,7 @@ def run_strategy(hbt, recorder, metrics, end_close_ts_ns):
     ask_order_id = 20_001
     bid_inflight_until = 0
     ask_inflight_until = 0
+    next_rest_allowed_ts = 0
     bid_live_since = 0
     ask_live_since = 0
     bid_anchor_mid = 0.0
@@ -579,10 +690,11 @@ def run_strategy(hbt, recorder, metrics, end_close_ts_ns):
             count,
         )
 
-        bid_order_id, bid_inflight_until, bid_live_since, bid_anchor_mid = manage_bid(
+        bid_order_id, bid_inflight_until, next_rest_allowed_ts, bid_live_since, bid_anchor_mid = manage_bid(
             hbt,
             bid_order_id,
             bid_inflight_until,
+            next_rest_allowed_ts,
             bid_live_since,
             bid_anchor_mid,
             signal_ts,
@@ -594,10 +706,11 @@ def run_strategy(hbt, recorder, metrics, end_close_ts_ns):
             count,
             metrics,
         )
-        ask_order_id, ask_inflight_until, ask_live_since, ask_anchor_mid = manage_ask(
+        ask_order_id, ask_inflight_until, next_rest_allowed_ts, ask_live_since, ask_anchor_mid = manage_ask(
             hbt,
             ask_order_id,
             ask_inflight_until,
+            next_rest_allowed_ts,
             ask_live_since,
             ask_anchor_mid,
             signal_ts,
@@ -618,7 +731,7 @@ def run_strategy(hbt, recorder, metrics, end_close_ts_ns):
             delta_value = state.trading_value - last_trading_value
             exec_px = 0.0
             if abs(delta_contracts) > 0 and delta_value > 0:
-                exec_px = abs(delta_contracts) * BITMEX_CONTRACT_SIZE / delta_value
+                exec_px = delta_value / (abs(delta_contracts) * BITMEX_CONTRACT_SIZE)
             fill_base = abs(bitmex_base_from_contracts(delta_contracts, mid))
             metrics[0] += fill_base
             metrics[3] += state.num_trades - last_trades
@@ -659,7 +772,7 @@ def run_backtest(bitmex_npz: Path, yyyymmdd: str) -> Path:
     asset = (
         BacktestAsset()
         .data([str(bitmex_npz)])
-        .inverse_asset(BITMEX_CONTRACT_SIZE)
+        .linear_asset(BITMEX_CONTRACT_SIZE)
         .constant_order_latency(BITMEX_ORDER_ENTRY_LATENCY_NS, BITMEX_ORDER_RESPONSE_LATENCY_NS)
         .risk_adverse_queue_model()
         .no_partial_fill_exchange()
@@ -678,7 +791,7 @@ def run_backtest(bitmex_npz: Path, yyyymmdd: str) -> Path:
     ttl_ms = int(ORDER_TTL_NS / 1_000_000)
     half_spread_tag = str(BASE_HALF_SPREAD_BPS).replace(".", "p")
     param_tag = RESULT_TAG or f"hs{half_spread_tag}_ttl{ttl_ms}"
-    out = RESULT_DIR / f"bitmex_xbtusd_single_market_mm_{param_tag}_{yyyymmdd}.npz"
+    out = RESULT_DIR / f"bitmex_xbtusdt_single_market_mm_{param_tag}_{yyyymmdd}.npz"
     np.savez_compressed(out, **{"0": recorder.get(0), "metrics": metrics})
     write_summary(out, metrics, yyyymmdd)
     return out
@@ -703,10 +816,10 @@ def write_summary(result_npz: Path, metrics: np.ndarray | None = None, yyyymmdd:
     final = records[-1]
     price = float(final["price"])
     final_contracts = float(final["position"])
-    final_base = final_contracts * BITMEX_CONTRACT_SIZE / price
-    equity_btc = -float(final["balance"]) - final_contracts * BITMEX_CONTRACT_SIZE / price - float(final["fee"])
-    total_pnl_usdt = equity_btc * price
-    total_fee_usdt = float(final["fee"]) * price
+    final_base = final_contracts * BITMEX_CONTRACT_SIZE
+    equity_usdt = float(final["balance"]) + final_contracts * price * BITMEX_CONTRACT_SIZE - float(final["fee"])
+    total_pnl_usdt = equity_usdt
+    total_fee_usdt = float(final["fee"])
     avg_capture = metrics[30] / metrics[31] if metrics[31] > 0 else 0.0
     final_flat = abs(final_contracts) < 1e-9
     pnl_status = "profit" if total_pnl_usdt > 0 else "loss" if total_pnl_usdt < 0 else "flat"
@@ -723,9 +836,11 @@ def write_summary(result_npz: Path, metrics: np.ndarray | None = None, yyyymmdd:
         "soft_position_contracts": SOFT_POSITION_CONTRACTS,
         "inventory_skew_bps_at_soft_limit": INVENTORY_SKEW_BPS_AT_SOFT_LIMIT,
         "order_qty_contracts": BITMEX_ORDER_QTY,
+        "order_qty_base": BITMEX_ORDER_QTY * BITMEX_CONTRACT_SIZE,
         "order_ttl_ms": ORDER_TTL_NS / 1_000_000.0,
         "order_update_interval_ms": ORDER_UPDATE_INTERVAL_NS / 1_000_000.0,
         "command_inflight_ms": BITMEX_COMMAND_INFLIGHT_NS / 1_000_000.0,
+        "rest_min_interval_ms": BITMEX_REST_MIN_INTERVAL_NS / 1_000_000.0,
         "order_entry_latency_ms": BITMEX_ORDER_ENTRY_LATENCY_NS / 1_000_000.0,
         "order_response_latency_ms": BITMEX_ORDER_RESPONSE_LATENCY_NS / 1_000_000.0,
         "short_momentum_window_ms": SHORT_MOMENTUM_WINDOW_NS / 1_000_000.0,
@@ -773,15 +888,17 @@ def write_summary(result_npz: Path, metrics: np.ndarray | None = None, yyyymmdd:
         "min_equity_usdt": float(metrics[29]),
         "avg_spread_capture_usdt_per_btc": float(avg_capture),
         "spread_capture_events": int(metrics[31]),
+        "bid_rest_pacing_skip_events": int(metrics[32]),
+        "ask_rest_pacing_skip_events": int(metrics[33]),
         "final_position_contracts": final_contracts,
         "final_position_base": final_base,
         "final_flat": final_flat,
-        "equity_btc": equity_btc,
+        "equity_usdt": equity_usdt,
         "start_timestamp_ns": int(records[0]["timestamp"]),
         "end_timestamp_ns": int(final["timestamp"]),
         "records": int(len(records)),
         "num_trades": int(final["num_trades"]),
-        "trading_value_btc": float(final["trading_value"]),
+        "trading_value_usdt": float(final["trading_value"]),
     }
     summary_path = result_npz.with_suffix(".summary.json")
     report_path = result_npz.with_suffix(".report.md")
@@ -805,6 +922,7 @@ def render_console_summary(summary: dict) -> str:
             f"最大仓位: {summary['max_position_contracts_seen']:,.0f} contracts / {summary['max_position_base']:,.8f} BTC",
             f"平均 spread capture: {summary['avg_spread_capture_usdt_per_btc']:,.4f} USDT/BTC",
             f"toxic fill: {summary['toxic_fill_events']}",
+            f"REST pacing skip: bid={summary['bid_rest_pacing_skip_events']}, ask={summary['ask_rest_pacing_skip_events']}",
             f"toxic cancel: bid={summary['bid_toxic_cancel_events']}, ask={summary['ask_toxic_cancel_events']}",
             f"TTL cancel: bid={summary['bid_ttl_cancel_events']}, ask={summary['ask_ttl_cancel_events']}",
             f"库存 cancel: bid={summary['bid_inventory_cancel_events']}, ask={summary['ask_inventory_cancel_events']}",
@@ -817,7 +935,7 @@ def render_console_summary(summary: dict) -> str:
 
 
 def render_report(summary: dict) -> str:
-    return f"""# BitMEX XBTUSD 单市场做市回测报告
+    return f"""# BitMEX {summary['symbol']} 单市场做市回测报告
 
 本次回测结果为 **{summary['pnl_status_zh']}**，总 PnL 为 **{signed_money(summary['total_pnl_usdt'])}**。
 
@@ -833,6 +951,7 @@ def render_report(summary: dict) -> str:
 - soft 仓位处库存 skew: `{summary['inventory_skew_bps_at_soft_limit']} bps`
 - quote TTL: `{summary['order_ttl_ms']} ms`
 - 更新间隔: `{summary['order_update_interval_ms']} ms`
+- REST 最小间隔: `{summary['rest_min_interval_ms']} ms`
 - 订单延迟: `{summary['order_entry_latency_ms']} ms entry`, `{summary['order_response_latency_ms']} ms response`
 - 短动量窗口: `{summary['short_momentum_window_ms']} ms`
 - 短动量撤单阈值: `{summary['momentum_cancel_bps']} bps`
@@ -852,6 +971,8 @@ def render_report(summary: dict) -> str:
 - 卖成交: `{summary['sell_fills']}`
 - 平均 spread capture: `{summary['avg_spread_capture_usdt_per_btc']:,.4f} USDT/BTC`
 - toxic fill: `{summary['toxic_fill_events']}`
+- bid REST pacing skip: `{summary['bid_rest_pacing_skip_events']}`
+- ask REST pacing skip: `{summary['ask_rest_pacing_skip_events']}`
 - bid toxic cancel: `{summary['bid_toxic_cancel_events']}`
 - ask toxic cancel: `{summary['ask_toxic_cancel_events']}`
 - bid TTL cancel: `{summary['bid_ttl_cancel_events']}`
@@ -863,12 +984,13 @@ def render_report(summary: dict) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Backtest a single-market BitMEX XBTUSD market making strategy.")
+    parser = argparse.ArgumentParser(description="Backtest a single-market BitMEX XBTUSDT market making strategy.")
     parser.add_argument("--dates", nargs="+", default=list(DEFAULT_DATES), help="YYYYMMDD dates to run.")
     parser.add_argument("--skip-download", action="store_true", help="Use existing CSV/NPZ files only.")
     parser.add_argument("--buffer-rows", type=int, default=None, help="Override tardis conversion buffer rows.")
     parser.add_argument("--base-half-spread-bps", type=float, default=BASE_HALF_SPREAD_BPS)
     parser.add_argument("--order-ttl-ms", type=float, default=ORDER_TTL_NS / 1_000_000.0)
+    parser.add_argument("--rest-min-interval-ms", type=float, default=BITMEX_REST_MIN_INTERVAL_NS / 1_000_000.0)
     parser.add_argument("--max-position-contracts", type=float, default=MAX_POSITION_CONTRACTS)
     parser.add_argument("--soft-position-contracts", type=float, default=SOFT_POSITION_CONTRACTS)
     parser.add_argument("--inventory-skew-bps", type=float, default=INVENTORY_SKEW_BPS_AT_SOFT_LIMIT)
@@ -882,6 +1004,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     global BASE_HALF_SPREAD_BPS
     global ORDER_TTL_NS
+    global BITMEX_REST_MIN_INTERVAL_NS
     global MAX_POSITION_CONTRACTS
     global SOFT_POSITION_CONTRACTS
     global INVENTORY_SKEW_BPS_AT_SOFT_LIMIT
@@ -893,6 +1016,7 @@ def main() -> None:
     args = parse_args()
     BASE_HALF_SPREAD_BPS = args.base_half_spread_bps
     ORDER_TTL_NS = int(args.order_ttl_ms * 1_000_000)
+    BITMEX_REST_MIN_INTERVAL_NS = int(args.rest_min_interval_ms * 1_000_000)
     MAX_POSITION_CONTRACTS = args.max_position_contracts
     SOFT_POSITION_CONTRACTS = args.soft_position_contracts
     INVENTORY_SKEW_BPS_AT_SOFT_LIMIT = args.inventory_skew_bps
