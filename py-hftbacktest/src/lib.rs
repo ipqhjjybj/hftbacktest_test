@@ -7,37 +7,20 @@ pub use fuse::*;
 use hftbacktest::live::{Instrument, LiveBotBuilder};
 use hftbacktest::{
     backtest::{
-        Asset,
-        Backtest,
-        DataSource,
+        Asset, Backtest, DataSource,
         assettype::{InverseAsset, LinearAsset},
         data::{Data, DataPtr, FeedLatencyAdjustment, Reader, read_npz_file},
         models::{
-            CommonFees,
-            ConstantLatency,
-            FlatPerTradeFeeModel,
-            IntpOrderLatency,
-            L3FIFOQueueModel,
-            LogProbQueueFunc,
-            LogProbQueueFunc2,
-            OrderLatencyRow,
-            PowerProbQueueFunc,
-            PowerProbQueueFunc2,
-            PowerProbQueueFunc3,
-            ProbQueueModel,
-            RiskAdverseQueueModel,
-            TradingQtyFeeModel,
-            TradingValueFeeModel,
+            CommonFees, ConstantLatency, FlatPerTradeFeeModel, IntpOrderLatency, L3FIFOQueueModel,
+            LogProbQueueFunc, LogProbQueueFunc2, OrderLatencyRow, PowerProbQueueFunc,
+            PowerProbQueueFunc2, PowerProbQueueFunc3, ProbQueueModel, RiskAdverseQueueModel,
+            TradingQtyFeeModel, TradingValueFeeModel,
         },
         order::order_bus,
         proc::{
-            L3Local,
-            L3NoPartialFillExchange,
-            Local,
-            LocalProcessor,
-            NoPartialFillExchange,
-            PartialFillExchange,
-            Processor,
+            L3Local, L3NoPartialFillExchange, LiveL2NoPartialFillExchange, Local,
+            LocalProcessor, NoPartialFillExchange, PartialFillExchange, Processor,
+            StrictNoPartialFillExchange,
         },
         state::State,
     },
@@ -94,6 +77,11 @@ pub enum QueueModel {
 #[derive(Clone)]
 pub enum ExchangeKind {
     NoPartialFillExchange {},
+    StrictNoPartialFillExchange {},
+    LiveL2NoPartialFillExchange {
+        trade_through_probability: f64,
+        min_order_age_ns: i64,
+    },
     PartialFillExchange {},
 }
 
@@ -438,6 +426,38 @@ impl BacktestAsset {
         slf
     }
 
+    /// Uses a conservative maker fill exchange model that expires resting maker orders when
+    /// the market crosses them without a same-price queue fill.
+    pub fn strict_no_partial_fill_exchange(mut slf: PyRefMut<Self>) -> PyRefMut<Self> {
+        slf.exch_kind = ExchangeKind::StrictNoPartialFillExchange {};
+        slf
+    }
+
+    /// Uses a live-calibrated L2 exchange model. Same-price trades still use the queue model,
+    /// while trade-through maker fills are accepted by the configured deterministic probability.
+    #[pyo3(signature = (trade_through_probability=0.145, min_order_age_ns=0))]
+    pub fn live_l2_no_partial_fill_exchange(
+        mut slf: PyRefMut<Self>,
+        trade_through_probability: f64,
+        min_order_age_ns: i64,
+    ) -> PyResult<PyRefMut<Self>> {
+        if !(0.0..=1.0).contains(&trade_through_probability) {
+            return Err(PyErr::new::<PyValueError, _>(
+                "trade_through_probability must be between 0 and 1",
+            ));
+        }
+        if min_order_age_ns < 0 {
+            return Err(PyErr::new::<PyValueError, _>(
+                "min_order_age_ns must be greater than or equal to 0",
+            ));
+        }
+        slf.exch_kind = ExchangeKind::LiveL2NoPartialFillExchange {
+            trade_through_probability,
+            min_order_age_ns,
+        };
+        Ok(slf)
+    }
+
     /// Uses the `PartiallFillExchange <https://docs.rs/hftbacktest/latest/hftbacktest/backtest/proc/struct.PartialFillExchange.html>`_
     /// for the exchange model.
     pub fn partial_fill_exchange(mut slf: PyRefMut<Self>) -> PyRefMut<Self> {
@@ -551,7 +571,15 @@ pub fn build_hashmap_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<
                 PowerProbQueueModel3 { n },
                 L3FIFOQueueModel {}
             ],
-            [NoPartialFillExchange {}, PartialFillExchange {}],
+            [
+                NoPartialFillExchange {},
+                StrictNoPartialFillExchange {},
+                LiveL2NoPartialFillExchange {
+                    trade_through_probability,
+                    min_order_age_ns
+                },
+                PartialFillExchange {}
+            ],
             [
                 TradingValueFeeModel { fees },
                 TradingQtyFeeModel { fees },
@@ -608,7 +636,15 @@ pub fn build_roivec_backtest(assets: Vec<PyRefMut<BacktestAsset>>) -> PyResult<u
                 PowerProbQueueModel3 { n },
                 L3FIFOQueueModel {}
             ],
-            [NoPartialFillExchange {}, PartialFillExchange {}],
+            [
+                NoPartialFillExchange {},
+                StrictNoPartialFillExchange {},
+                LiveL2NoPartialFillExchange {
+                    trade_through_probability,
+                    min_order_age_ns
+                },
+                PartialFillExchange {}
+            ],
             [
                 TradingValueFeeModel { fees },
                 TradingQtyFeeModel { fees },

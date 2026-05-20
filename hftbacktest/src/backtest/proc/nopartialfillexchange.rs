@@ -17,22 +17,10 @@ use crate::{
     depth::{INVALID_MAX, INVALID_MIN, L2MarketDepth, MarketDepth},
     prelude::OrdType,
     types::{
-        EXCH_ASK_DEPTH_CLEAR_EVENT,
-        EXCH_ASK_DEPTH_EVENT,
-        EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
-        EXCH_BID_DEPTH_CLEAR_EVENT,
-        EXCH_BID_DEPTH_EVENT,
-        EXCH_BID_DEPTH_SNAPSHOT_EVENT,
-        EXCH_BUY_TRADE_EVENT,
-        EXCH_DEPTH_CLEAR_EVENT,
-        EXCH_EVENT,
-        EXCH_SELL_TRADE_EVENT,
-        Event,
-        Order,
-        OrderId,
-        Side,
-        Status,
-        TimeInForce,
+        EXCH_ASK_DEPTH_CLEAR_EVENT, EXCH_ASK_DEPTH_EVENT, EXCH_ASK_DEPTH_SNAPSHOT_EVENT,
+        EXCH_BID_DEPTH_CLEAR_EVENT, EXCH_BID_DEPTH_EVENT, EXCH_BID_DEPTH_SNAPSHOT_EVENT,
+        EXCH_BUY_TRADE_EVENT, EXCH_DEPTH_CLEAR_EVENT, EXCH_EVENT, EXCH_SELL_TRADE_EVENT, Event,
+        Order, OrderId, Side, Status, TimeInForce,
     },
 };
 
@@ -61,7 +49,15 @@ use crate::{
 /// best. Be aware that this may cause unrealistic fill simulations if you attempt to execute a
 /// large quantity.
 ///
-pub struct NoPartialFillExchange<AT, LM, QM, MD, FM>
+pub struct NoPartialFillExchange<
+    AT,
+    LM,
+    QM,
+    MD,
+    FM,
+    const STRICT_MAKER_QUEUE: bool = false,
+    const LIVE_L2_MAKER_QUEUE: bool = false,
+>
 where
     AT: AssetType,
     LM: LatencyModel,
@@ -82,9 +78,12 @@ where
     queue_model: QM,
 
     filled_orders: Vec<OrderId>,
+
+    live_l2_trade_through_probability: f64,
+    live_l2_min_order_age_ns: i64,
 }
 
-impl<AT, LM, QM, MD, FM> NoPartialFillExchange<AT, LM, QM, MD, FM>
+impl<AT, LM, QM, MD, FM> NoPartialFillExchange<AT, LM, QM, MD, FM, false>
 where
     AT: AssetType,
     LM: LatencyModel,
@@ -99,6 +98,36 @@ where
         queue_model: QM,
         order_e2l: ExchToLocal<LM>,
     ) -> Self {
+        Self::new_with_mode(depth, state, queue_model, order_e2l)
+    }
+}
+
+impl<AT, LM, QM, MD, FM, const STRICT_MAKER_QUEUE: bool, const LIVE_L2_MAKER_QUEUE: bool>
+    NoPartialFillExchange<AT, LM, QM, MD, FM, STRICT_MAKER_QUEUE, LIVE_L2_MAKER_QUEUE>
+where
+    AT: AssetType,
+    LM: LatencyModel,
+    QM: QueueModel<MD>,
+    MD: MarketDepth,
+    FM: FeeModel,
+{
+    fn new_with_mode(
+        depth: MD,
+        state: State<AT, FM>,
+        queue_model: QM,
+        order_e2l: ExchToLocal<LM>,
+    ) -> Self {
+        Self::new_with_live_l2_mode(depth, state, queue_model, order_e2l, 1.0, 0)
+    }
+
+    fn new_with_live_l2_mode(
+        depth: MD,
+        state: State<AT, FM>,
+        queue_model: QM,
+        order_e2l: ExchToLocal<LM>,
+        live_l2_trade_through_probability: f64,
+        live_l2_min_order_age_ns: i64,
+    ) -> Self {
         Self {
             orders: Default::default(),
             buy_orders: Default::default(),
@@ -108,7 +137,68 @@ where
             state,
             queue_model,
             filled_orders: Default::default(),
+            live_l2_trade_through_probability,
+            live_l2_min_order_age_ns,
         }
+    }
+
+    fn deterministic_unit(
+        &self,
+        order_id: OrderId,
+        timestamp: i64,
+        price_tick: i64,
+        market_tick: i64,
+    ) -> f64 {
+        let mut x = order_id
+            ^ (timestamp as u64).rotate_left(17)
+            ^ (price_tick as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ (market_tick as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^= x >> 31;
+        ((x >> 11) as f64) * (1.0 / ((1_u64 << 53) as f64))
+    }
+
+    fn live_l2_accept_trade_through(
+        &self,
+        order: &Order,
+        timestamp: i64,
+        market_tick: i64,
+    ) -> bool {
+        if !LIVE_L2_MAKER_QUEUE {
+            return true;
+        }
+        if self.live_l2_min_order_age_ns > 0
+            && timestamp - order.exch_timestamp < self.live_l2_min_order_age_ns
+        {
+            return false;
+        }
+        if self.live_l2_trade_through_probability <= 0.0 {
+            return false;
+        }
+        if self.live_l2_trade_through_probability >= 1.0 {
+            return true;
+        }
+        self.deterministic_unit(order.order_id, timestamp, order.price_tick, market_tick)
+            < self.live_l2_trade_through_probability
+    }
+
+    fn handle_crossed_maker_order(
+        &mut self,
+        order: &mut Order,
+        timestamp: i64,
+        market_tick: i64,
+    ) -> Result<(), BacktestError> {
+        self.filled_orders.push(order.order_id);
+        if STRICT_MAKER_QUEUE
+            || (LIVE_L2_MAKER_QUEUE
+                && !self.live_l2_accept_trade_through(order, timestamp, market_tick))
+        {
+            return self.expire::<true>(order, timestamp);
+        }
+        self.fill::<true>(order, timestamp, true, order.price_tick)
     }
 
     fn check_if_sell_filled(
@@ -121,8 +211,7 @@ where
         match order.price_tick.cmp(&price_tick) {
             Ordering::Greater => {}
             Ordering::Less => {
-                self.filled_orders.push(order.order_id);
-                return self.fill::<true>(order, timestamp, true, order.price_tick);
+                return self.handle_crossed_maker_order(order, timestamp, price_tick);
             }
             Ordering::Equal => {
                 // Updates the order's queue position.
@@ -145,8 +234,7 @@ where
     ) -> Result<(), BacktestError> {
         match order.price_tick.cmp(&price_tick) {
             Ordering::Greater => {
-                self.filled_orders.push(order.order_id);
-                return self.fill::<true>(order, timestamp, true, order.price_tick);
+                return self.handle_crossed_maker_order(order, timestamp, price_tick);
             }
             Ordering::Less => {}
             Ordering::Equal => {
@@ -157,6 +245,29 @@ where
                     return self.fill::<true>(order, timestamp, true, order.price_tick);
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn expire<const MAKE_RESPONSE: bool>(
+        &mut self,
+        order: &mut Order,
+        timestamp: i64,
+    ) -> Result<(), BacktestError> {
+        if order.status == Status::Expired
+            || order.status == Status::Canceled
+            || order.status == Status::Filled
+        {
+            return Err(BacktestError::InvalidOrderStatus);
+        }
+
+        order.exec_qty = 0.0;
+        order.leaves_qty = 0.0;
+        order.status = Status::Expired;
+        order.exch_timestamp = timestamp;
+
+        if MAKE_RESPONSE {
+            self.order_e2l.respond(order.clone());
         }
         Ok(())
     }
@@ -245,6 +356,32 @@ where
         new_best_tick: i64,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
+        if STRICT_MAKER_QUEUE || LIVE_L2_MAKER_QUEUE {
+            {
+                let orders = self.orders.clone();
+                let mut orders_borrowed = orders.borrow_mut();
+                if prev_best_tick == INVALID_MIN
+                    || (orders_borrowed.len() as i64) < new_best_tick - prev_best_tick
+                {
+                    for (_, order) in orders_borrowed.iter_mut() {
+                        if order.side == Side::Sell && order.price_tick <= new_best_tick {
+                            self.handle_crossed_maker_order(order, timestamp, new_best_tick)?;
+                        }
+                    }
+                } else {
+                    for t in (prev_best_tick + 1)..=new_best_tick {
+                        if let Some(order_ids) = self.sell_orders.get(&t) {
+                            for order_id in order_ids.clone().iter() {
+                                let order = orders_borrowed.get_mut(order_id).unwrap();
+                                self.handle_crossed_maker_order(order, timestamp, new_best_tick)?;
+                            }
+                        }
+                    }
+                }
+            }
+            self.remove_filled_orders();
+            return Ok(());
+        }
         // If the best has been significantly updated compared to the previous best, it would be
         // better to iterate orders dict instead of order price ladder.
         {
@@ -281,6 +418,32 @@ where
         new_best_tick: i64,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
+        if STRICT_MAKER_QUEUE || LIVE_L2_MAKER_QUEUE {
+            {
+                let orders = self.orders.clone();
+                let mut orders_borrowed = orders.borrow_mut();
+                if prev_best_tick == INVALID_MAX
+                    || (orders_borrowed.len() as i64) < prev_best_tick - new_best_tick
+                {
+                    for (_, order) in orders_borrowed.iter_mut() {
+                        if order.side == Side::Buy && order.price_tick >= new_best_tick {
+                            self.handle_crossed_maker_order(order, timestamp, new_best_tick)?;
+                        }
+                    }
+                } else {
+                    for t in new_best_tick..prev_best_tick {
+                        if let Some(order_ids) = self.buy_orders.get(&t) {
+                            for order_id in order_ids.clone().iter() {
+                                let order = orders_borrowed.get_mut(order_id).unwrap();
+                                self.handle_crossed_maker_order(order, timestamp, new_best_tick)?;
+                            }
+                        }
+                    }
+                }
+            }
+            self.remove_filled_orders();
+            return Ok(());
+        }
         // If the best has been significantly updated compared to the previous best, it would be
         // better to iterate orders dict instead of order price ladder.
         {
@@ -514,7 +677,155 @@ where
     }
 }
 
-impl<AT, LM, QM, MD, FM> Processor for NoPartialFillExchange<AT, LM, QM, MD, FM>
+/// A conservative no-partial-fill exchange that only fills maker orders through same-price queue depletion.
+pub struct StrictNoPartialFillExchange<AT, LM, QM, MD, FM>(
+    NoPartialFillExchange<AT, LM, QM, MD, FM, true>,
+)
+where
+    AT: AssetType,
+    LM: LatencyModel,
+    QM: QueueModel<MD>,
+    MD: MarketDepth,
+    FM: FeeModel;
+
+impl<AT, LM, QM, MD, FM> StrictNoPartialFillExchange<AT, LM, QM, MD, FM>
+where
+    AT: AssetType,
+    LM: LatencyModel,
+    QM: QueueModel<MD>,
+    MD: MarketDepth,
+    FM: FeeModel,
+{
+    /// Constructs an instance of `StrictNoPartialFillExchange`.
+    pub fn new(
+        depth: MD,
+        state: State<AT, FM>,
+        queue_model: QM,
+        order_e2l: ExchToLocal<LM>,
+    ) -> Self {
+        Self(NoPartialFillExchange::new_with_mode(
+            depth,
+            state,
+            queue_model,
+            order_e2l,
+        ))
+    }
+}
+
+impl<AT, LM, QM, MD, FM> Processor for StrictNoPartialFillExchange<AT, LM, QM, MD, FM>
+where
+    AT: AssetType,
+    LM: LatencyModel,
+    QM: QueueModel<MD>,
+    MD: MarketDepth + L2MarketDepth,
+    FM: FeeModel,
+{
+    fn event_seen_timestamp(&self, event: &Event) -> Option<i64> {
+        self.0.event_seen_timestamp(event)
+    }
+
+    fn process(&mut self, event: &Event) -> Result<(), BacktestError> {
+        self.0.process(event)
+    }
+
+    fn process_recv_order(
+        &mut self,
+        timestamp: i64,
+        wait_resp_order_id: Option<OrderId>,
+    ) -> Result<bool, BacktestError> {
+        self.0.process_recv_order(timestamp, wait_resp_order_id)
+    }
+
+    fn earliest_recv_order_timestamp(&self) -> i64 {
+        self.0.earliest_recv_order_timestamp()
+    }
+
+    fn earliest_send_order_timestamp(&self) -> i64 {
+        self.0.earliest_send_order_timestamp()
+    }
+}
+
+pub struct LiveL2NoPartialFillExchange<AT, LM, QM, MD, FM>(
+    NoPartialFillExchange<AT, LM, QM, MD, FM, false, true>,
+)
+where
+    AT: AssetType,
+    LM: LatencyModel,
+    QM: QueueModel<MD>,
+    MD: MarketDepth,
+    FM: FeeModel;
+
+impl<AT, LM, QM, MD, FM> LiveL2NoPartialFillExchange<AT, LM, QM, MD, FM>
+where
+    AT: AssetType,
+    LM: LatencyModel,
+    QM: QueueModel<MD>,
+    MD: MarketDepth,
+    FM: FeeModel,
+{
+    /// Constructs a live-calibrated L2 exchange model.
+    pub fn new(
+        depth: MD,
+        state: State<AT, FM>,
+        queue_model: QM,
+        order_e2l: ExchToLocal<LM>,
+        trade_through_probability: f64,
+        min_order_age_ns: i64,
+    ) -> Self {
+        Self(NoPartialFillExchange::new_with_live_l2_mode(
+            depth,
+            state,
+            queue_model,
+            order_e2l,
+            trade_through_probability,
+            min_order_age_ns,
+        ))
+    }
+}
+
+impl<AT, LM, QM, MD, FM> Processor for LiveL2NoPartialFillExchange<AT, LM, QM, MD, FM>
+where
+    AT: AssetType,
+    LM: LatencyModel,
+    QM: QueueModel<MD>,
+    MD: MarketDepth + L2MarketDepth,
+    FM: FeeModel,
+{
+    fn event_seen_timestamp(&self, event: &Event) -> Option<i64> {
+        self.0.event_seen_timestamp(event)
+    }
+
+    fn process(&mut self, event: &Event) -> Result<(), BacktestError> {
+        self.0.process(event)
+    }
+
+    fn process_recv_order(
+        &mut self,
+        timestamp: i64,
+        wait_resp_order_id: Option<OrderId>,
+    ) -> Result<bool, BacktestError> {
+        self.0.process_recv_order(timestamp, wait_resp_order_id)
+    }
+
+    fn earliest_recv_order_timestamp(&self) -> i64 {
+        self.0.earliest_recv_order_timestamp()
+    }
+
+    fn earliest_send_order_timestamp(&self) -> i64 {
+        self.0.earliest_send_order_timestamp()
+    }
+}
+
+impl<
+        AT,
+        LM,
+        QM,
+        MD,
+        FM,
+        const STRICT_MAKER_QUEUE: bool,
+        const LIVE_L2_MAKER_QUEUE: bool,
+    > Processor
+    for NoPartialFillExchange<AT, LM, QM, MD, FM, STRICT_MAKER_QUEUE, LIVE_L2_MAKER_QUEUE>
 where
     AT: AssetType,
     LM: LatencyModel,

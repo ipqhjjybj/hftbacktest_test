@@ -20,21 +20,16 @@ use crate::{
         evs::{EventIntentKind, EventSet},
         models::{LatencyModel, QueueModel},
         order::order_bus,
-        proc::{Local, LocalProcessor, NoPartialFillExchange, PartialFillExchange, Processor},
+        proc::{
+            LiveL2NoPartialFillExchange, Local, LocalProcessor, NoPartialFillExchange,
+            PartialFillExchange, Processor, StrictNoPartialFillExchange,
+        },
         state::State,
     },
     depth::{L2MarketDepth, L3MarketDepth, MarketDepth},
     prelude::{
-        Bot,
-        OrdType,
-        Order,
-        OrderId,
-        OrderRequest,
-        Side,
-        StateValues,
-        TimeInForce,
-        UNTIL_END_OF_DATA,
-        WaitOrderResponse,
+        Bot, OrdType, Order, OrderId, OrderRequest, Side, StateValues, TimeInForce,
+        UNTIL_END_OF_DATA, WaitOrderResponse,
     },
     types::{BuildError, ElapseResult, Event},
 };
@@ -126,6 +121,15 @@ impl<L, E, D: NpyDTyped + Clone> Asset<L, E, D> {
 pub enum ExchangeKind {
     /// Uses [NoPartialFillExchange](`NoPartialFillExchange`).
     NoPartialFillExchange,
+    /// Uses [NoPartialFillExchange] but expires resting maker orders when the market crosses them
+    /// without a same-price queue fill.
+    StrictNoPartialFillExchange,
+    /// Uses a live-calibrated L2 exchange model that accepts only a fraction of trade-through
+    /// maker fills while keeping same-price queue fills unchanged.
+    LiveL2NoPartialFillExchange {
+        trade_through_probability: f64,
+        min_order_age_ns: i64,
+    },
     /// Uses [PartialFillExchange](`PartialFillExchange`).
     PartialFillExchange,
 }
@@ -312,6 +316,39 @@ where
                     State::new(asset_type, fee_model),
                     queue_model,
                     order_e2l,
+                );
+
+                Ok(Asset {
+                    local: Box::new(local),
+                    exch: Box::new(exch),
+                    reader,
+                })
+            }
+            ExchangeKind::StrictNoPartialFillExchange => {
+                let exch = StrictNoPartialFillExchange::new(
+                    create_depth(),
+                    State::new(asset_type, fee_model),
+                    queue_model,
+                    order_e2l,
+                );
+
+                Ok(Asset {
+                    local: Box::new(local),
+                    exch: Box::new(exch),
+                    reader,
+                })
+            }
+            ExchangeKind::LiveL2NoPartialFillExchange {
+                trade_through_probability,
+                min_order_age_ns,
+            } => {
+                let exch = LiveL2NoPartialFillExchange::new(
+                    create_depth(),
+                    State::new(asset_type, fee_model),
+                    queue_model,
+                    order_e2l,
+                    trade_through_probability,
+                    min_order_age_ns,
                 );
 
                 Ok(Asset {
@@ -529,6 +566,34 @@ where
 
         match self.exch_kind {
             ExchangeKind::NoPartialFillExchange => {
+                let exch = L3NoPartialFillExchange::new(
+                    create_depth(),
+                    State::new(asset_type, fee_model),
+                    queue_model,
+                    order_e2l,
+                );
+
+                Ok(Asset {
+                    local: Box::new(local),
+                    exch: Box::new(exch),
+                    reader,
+                })
+            }
+            ExchangeKind::StrictNoPartialFillExchange => {
+                let exch = L3NoPartialFillExchange::new(
+                    create_depth(),
+                    State::new(asset_type, fee_model),
+                    queue_model,
+                    order_e2l,
+                );
+
+                Ok(Asset {
+                    local: Box::new(local),
+                    exch: Box::new(exch),
+                    reader,
+                })
+            }
+            ExchangeKind::LiveL2NoPartialFillExchange { .. } => {
                 let exch = L3NoPartialFillExchange::new(
                     create_depth(),
                     State::new(asset_type, fee_model),
@@ -1145,17 +1210,13 @@ mod test {
 
     use crate::{
         backtest::{
-            Backtest,
-            DataSource,
+            Backtest, DataSource,
             ExchangeKind::NoPartialFillExchange,
             L2AssetBuilder,
             assettype::LinearAsset,
             data::Data,
             models::{
-                CommonFees,
-                ConstantLatency,
-                PowerProbQueueFunc3,
-                ProbQueueModel,
+                CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel,
                 TradingValueFeeModel,
             },
         },

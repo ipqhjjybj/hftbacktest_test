@@ -3,14 +3,7 @@ use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
 use quote::quote;
 use syn::{
-    self,
-    Data,
-    DeriveInput,
-    Error,
-    Fields,
-    Token,
-    braced,
-    bracketed,
+    self, Data, DeriveInput, Error, Fields, Token, braced, bracketed,
     parse::{Parse, ParseStream},
     parse_macro_input,
 };
@@ -231,6 +224,13 @@ pub fn build_asset(input: TokenStream) -> TokenStream {
                         } else {
                             (Ident::new("Local", Span::call_site()), em_ident.clone())
                         };
+                        let exch_extra_args = if l3 {
+                            quote! {}
+                        } else {
+                            quote! {
+                                , #(#em_args.clone()),*
+                            }
+                        };
 
                         let depth_construct = match marketdepth.to_string().as_str() {
                             "HashMapMarketDepth" => {
@@ -317,7 +317,8 @@ pub fn build_asset(input: TokenStream) -> TokenStream {
                                 market_depth,
                                 State::new(asset_type, fee_model.clone()),
                                 queue_model,
-                                order_e2l,
+                                order_e2l
+                                #exch_extra_args
                             ));
 
                             Asset {
