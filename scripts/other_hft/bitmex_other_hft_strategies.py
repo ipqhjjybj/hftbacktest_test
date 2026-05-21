@@ -47,6 +47,7 @@ STRATEGY_QUEUE_IMBALANCE_BREAKOUT = 2
 STRATEGY_LIQUIDITY_FADE = 3
 STRATEGY_MEAN_REVERSION_SCALPER = 4
 STRATEGY_PASSIVE_ENTRY_ACTIVE_EXIT = 5
+STRATEGY_MAKER_FIRST_EXIT = 6
 
 STRATEGY_SLUGS = {
     STRATEGY_ORDER_FLOW_MOMENTUM: "order_flow_momentum",
@@ -54,6 +55,7 @@ STRATEGY_SLUGS = {
     STRATEGY_LIQUIDITY_FADE: "liquidity_fade",
     STRATEGY_MEAN_REVERSION_SCALPER: "mean_reversion_scalper",
     STRATEGY_PASSIVE_ENTRY_ACTIVE_EXIT: "passive_entry_active_exit",
+    STRATEGY_MAKER_FIRST_EXIT: "maker_first_exit",
 }
 
 STRATEGY_MODE = STRATEGY_ORDER_FLOW_MOMENTUM
@@ -98,6 +100,8 @@ PASSIVE_ENTRY_TTL_NS = 1_500_000_000
 PASSIVE_MIN_AMEND_TICKS = 2.0
 PASSIVE_ALPHA_THRESHOLD = 0.30
 PASSIVE_EXIT_REVERSE_THRESHOLD = 0.10
+MAKER_EXIT_TTL_NS = 1_500_000_000
+MAKER_EXIT_MIN_AMEND_TICKS = 2.0
 
 
 @njit
@@ -398,6 +402,56 @@ def manage_passive_entry(hbt, signal, entry_order_id, live_since, metrics):
 
 
 @njit
+def maker_exit_price(pos, entry_px, depth):
+    if entry_px <= 0:
+        return 0.0
+    if pos > 0:
+        raw = entry_px * (1.0 + TARGET_PROFIT_BPS / 10_000.0)
+        return ceil_to_tick(max(raw, depth.best_ask), BITMEX_TICK_SIZE)
+    raw = entry_px * (1.0 - TARGET_PROFIT_BPS / 10_000.0)
+    return floor_to_tick(min(raw, depth.best_bid), BITMEX_TICK_SIZE)
+
+
+@njit
+def manage_maker_exit(hbt, exit_order_id, live_since, entry_px, metrics):
+    depth = hbt.depth(0)
+    pos = hbt.position(0)
+    existing = hbt.orders(0).get(exit_order_id)
+    if abs(pos) <= 0:
+        if existing is not None and existing.cancellable:
+            hbt.cancel(0, exit_order_id, False)
+            metrics[28] += 1
+        return 0
+
+    if live_since > 0 and hbt.current_timestamp - live_since >= MAKER_EXIT_TTL_NS:
+        if existing is not None and existing.cancellable:
+            hbt.cancel(0, exit_order_id, False)
+            metrics[30] += 1
+        return 0
+
+    px = maker_exit_price(pos, entry_px, depth)
+    qty = abs(pos)
+    if px <= 0 or qty < BITMEX_LOT_SIZE:
+        return live_since
+
+    if existing is not None:
+        price_changed = abs(existing.price - px) >= MAKER_EXIT_MIN_AMEND_TICKS * BITMEX_TICK_SIZE
+        qty_changed = existing.qty != qty
+        if existing.cancellable and (price_changed or qty_changed):
+            hbt.modify(0, exit_order_id, px, qty, False)
+            metrics[27] += 1
+            return hbt.current_timestamp
+        return live_since
+
+    if pos > 0:
+        hbt.submit_sell_order(0, exit_order_id, px, qty, GTX, LIMIT, False)
+    else:
+        hbt.submit_buy_order(0, exit_order_id, px, qty, GTX, LIMIT, False)
+    metrics[26] += 1
+    return hbt.current_timestamp
+
+
+@njit
 def should_exit_position(pos, signal, alpha, entry_px, entry_ts, now_ts, depth):
     if abs(pos) <= 0:
         return False
@@ -417,6 +471,29 @@ def should_exit_position(pos, signal, alpha, entry_px, entry_ts, now_ts, depth):
 
     if pnl_bps >= TARGET_PROFIT_BPS:
         return True
+    if pnl_bps <= -STOP_LOSS_BPS:
+        return True
+    return now_ts - entry_ts >= MAX_HOLD_NS
+
+
+@njit
+def should_emergency_exit_position(pos, signal, alpha, entry_px, entry_ts, now_ts, depth):
+    if abs(pos) <= 0:
+        return False
+    mid = current_mid(depth)
+    if entry_px <= 0 or mid <= 0:
+        return False
+
+    pnl_bps = 0.0
+    if pos > 0:
+        pnl_bps = ratio_minus_one_bps(mid, entry_px)
+        if signal < 0 and alpha <= -PASSIVE_EXIT_REVERSE_THRESHOLD:
+            return True
+    else:
+        pnl_bps = ratio_minus_one_bps(entry_px, mid)
+        if signal > 0 and alpha >= PASSIVE_EXIT_REVERSE_THRESHOLD:
+            return True
+
     if pnl_bps <= -STOP_LOSS_BPS:
         return True
     return now_ts - entry_ts >= MAX_HOLD_NS
@@ -512,7 +589,9 @@ def run_strategy(hbt, recorder, metrics, end_close_ts_ns):
     flow = np.zeros(6, dtype=np.float64)
     next_order_id = 100_001
     entry_order_id = 50_001
+    exit_order_id = 60_001
     entry_live_since = 0
+    exit_live_since = 0
     next_action_ts = 0
     last_record_ts = 0
     entry_px = 0.0
@@ -552,7 +631,30 @@ def run_strategy(hbt, recorder, metrics, end_close_ts_ns):
                 metrics[7] += 1
 
             pos = hbt.position(0)
-            if STRATEGY_MODE == STRATEGY_PASSIVE_ENTRY_ACTIVE_EXIT:
+            if STRATEGY_MODE == STRATEGY_MAKER_FIRST_EXIT:
+                if abs(pos) > 0 and should_emergency_exit_position(
+                    pos, sig, alpha, entry_px, entry_ts, hbt.current_timestamp, depth
+                ):
+                    cancel_all_orders(hbt)
+                    exit_live_since = 0
+                    if pos > 0:
+                        next_order_id, ok = submit_ioc_limit(hbt, -1, abs(pos), next_order_id)
+                    else:
+                        next_order_id, ok = submit_ioc_limit(hbt, 1, abs(pos), next_order_id)
+                    if ok:
+                        metrics[14] += 1
+                        metrics[29] += 1
+                        next_action_ts = hbt.current_timestamp + COOLDOWN_NS
+                elif abs(pos) > 0:
+                    if cancel_order(hbt, entry_order_id):
+                        metrics[17] += 1
+                    exit_live_since = manage_maker_exit(hbt, exit_order_id, exit_live_since, entry_px, metrics)
+                elif hbt.current_timestamp >= next_action_ts:
+                    if cancel_order(hbt, exit_order_id):
+                        metrics[28] += 1
+                    exit_live_since = 0
+                    entry_live_since = manage_passive_entry(hbt, sig, entry_order_id, entry_live_since, metrics)
+            elif STRATEGY_MODE == STRATEGY_PASSIVE_ENTRY_ACTIVE_EXIT:
                 if should_exit_position(pos, sig, alpha, entry_px, entry_ts, hbt.current_timestamp, depth):
                     if pos > 0:
                         next_order_id, ok = submit_ioc_limit(hbt, -1, abs(pos), next_order_id)
@@ -721,6 +823,11 @@ def write_summary(result_npz: Path, yyyymmdd: str) -> None:
         "passive_entry_place": int(metrics[16]),
         "passive_entry_cancel": int(metrics[17]),
         "passive_entry_modify": int(metrics[18]),
+        "maker_exit_place": int(metrics[26]),
+        "maker_exit_modify": int(metrics[27]),
+        "maker_exit_cancel": int(metrics[28]),
+        "emergency_exit_orders": int(metrics[29]),
+        "maker_exit_ttl_cancel": int(metrics[30]),
         "avg_abs_alpha": float(avg_abs_alpha),
         "market_buy_qty_seen": float(metrics[22]),
         "market_sell_qty_seen": float(metrics[23]),
@@ -752,6 +859,7 @@ def render_console_summary(summary: dict) -> str:
             f"最大仓位: {summary['max_position_contracts_seen']:,.0f} contracts",
             f"主动单: entry={summary['taker_entry_orders']}, exit={summary['taker_exit_orders']}",
             f"被动 entry: place={summary['passive_entry_place']}, modify={summary['passive_entry_modify']}, cancel={summary['passive_entry_cancel']}",
+            f"maker exit: place={summary['maker_exit_place']}, modify={summary['maker_exit_modify']}, cancel={summary['maker_exit_cancel']}, emergency={summary['emergency_exit_orders']}",
             "===========================================",
             "",
         ]
@@ -790,6 +898,10 @@ def render_report(summary: dict) -> str:
 - passive entry place: `{summary['passive_entry_place']}`
 - passive entry modify: `{summary['passive_entry_modify']}`
 - passive entry cancel: `{summary['passive_entry_cancel']}`
+- maker exit place: `{summary['maker_exit_place']}`
+- maker exit modify: `{summary['maker_exit_modify']}`
+- maker exit cancel: `{summary['maker_exit_cancel']}`
+- emergency exit orders: `{summary['emergency_exit_orders']}`
 """
 
 
