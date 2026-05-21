@@ -84,6 +84,7 @@ LADDER_INVENTORY_SKEW_BPS_AT_SOFT_LIMIT = 4.0
 
 RESULT_TAG = ""
 CURRENT_STRATEGY_MODE = STRATEGY_FIXED_SPREAD
+BITMEX_IS_INVERSE = False
 
 
 @njit
@@ -109,7 +110,11 @@ def ratio_minus_one_bps(numerator, denominator):
 
 
 @njit
-def bitmex_base_from_contracts(contracts):
+def bitmex_base_from_contracts(contracts, price):
+    if BITMEX_IS_INVERSE:
+        if price <= 0:
+            return 0.0
+        return contracts * BITMEX_CONTRACT_SIZE / price
     return contracts * BITMEX_CONTRACT_SIZE
 
 
@@ -118,6 +123,9 @@ def bitmex_equity_usdt(hbt):
     depth = hbt.depth(0)
     mid = (depth.best_bid + depth.best_ask) / 2.0
     state = hbt.state_values(0)
+    if BITMEX_IS_INVERSE:
+        equity_btc = state.balance + state.position * BITMEX_CONTRACT_SIZE / mid - state.fee
+        return equity_btc * mid
     return state.balance + state.position * mid * BITMEX_CONTRACT_SIZE - state.fee
 
 
@@ -392,8 +400,9 @@ def update_risk_metrics(hbt, metrics):
     depth = hbt.depth(0)
     if depth.best_bid <= 0 or depth.best_ask <= 0:
         return
+    mid = (depth.best_bid + depth.best_ask) / 2.0
     pos_contracts = abs(hbt.position(0))
-    pos_base = abs(bitmex_base_from_contracts(pos_contracts))
+    pos_base = abs(bitmex_base_from_contracts(pos_contracts, mid))
     metrics[1] = max(metrics[1], pos_base)
     metrics[2] = max(metrics[2], pos_contracts)
     equity = bitmex_equity_usdt(hbt)
@@ -552,8 +561,11 @@ def run_strategy(hbt, recorder, metrics, end_close_ts_ns, strategy_mode):
                 delta_value = state.trading_value - last_trading_value
                 exec_px = 0.0
                 if abs(delta_contracts) > 0 and delta_value > 0:
-                    exec_px = delta_value / (abs(delta_contracts) * BITMEX_CONTRACT_SIZE)
-                fill_base = abs(bitmex_base_from_contracts(delta_contracts))
+                    if BITMEX_IS_INVERSE:
+                        exec_px = abs(delta_contracts) * BITMEX_CONTRACT_SIZE / delta_value
+                    else:
+                        exec_px = delta_value / (abs(delta_contracts) * BITMEX_CONTRACT_SIZE)
+                fill_base = abs(bitmex_base_from_contracts(delta_contracts, exec_px if exec_px > 0 else mid))
                 fill_count = state.num_trades - last_trades
                 metrics[0] += fill_base
                 metrics[3] += fill_count
@@ -597,10 +609,13 @@ def strategy_slug(strategy_mode: int) -> str:
 
 def run_backtest(bitmex_npz: Path, yyyymmdd: str, strategy_mode: int) -> Path:
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    asset = BacktestAsset().data([str(bitmex_npz)])
+    if BITMEX_IS_INVERSE:
+        asset = asset.inverse_asset(BITMEX_CONTRACT_SIZE)
+    else:
+        asset = asset.linear_asset(BITMEX_CONTRACT_SIZE)
     asset = (
-        BacktestAsset()
-        .data([str(bitmex_npz)])
-        .linear_asset(BITMEX_CONTRACT_SIZE)
+        asset
         .constant_order_latency(BITMEX_ORDER_ENTRY_LATENCY_NS, BITMEX_ORDER_RESPONSE_LATENCY_NS)
         .risk_adverse_queue_model()
         .no_partial_fill_exchange()
@@ -617,7 +632,8 @@ def run_backtest(bitmex_npz: Path, yyyymmdd: str, strategy_mode: int) -> Path:
         raise RuntimeError("strategy returned false")
 
     tag = RESULT_TAG or default_result_tag(strategy_mode)
-    out = RESULT_DIR / f"bitmex_xbtusdt_single_market_{strategy_slug(strategy_mode)}_mm_{tag}_{yyyymmdd}.npz"
+    symbol_slug = BITMEX_SYMBOL.lower()
+    out = RESULT_DIR / f"bitmex_{symbol_slug}_single_market_{strategy_slug(strategy_mode)}_mm_{tag}_{yyyymmdd}.npz"
     np.savez_compressed(out, **{"0": recorder.get(0), "metrics": metrics})
     write_summary(out, metrics, yyyymmdd, strategy_mode)
     return out
@@ -649,7 +665,7 @@ def strategy_config(strategy_mode: int) -> dict:
         "max_position_contracts": MAX_POSITION_CONTRACTS,
         "soft_position_contracts": SOFT_POSITION_CONTRACTS,
         "order_qty_contracts": ORDER_QTY,
-        "order_qty_base": ORDER_QTY * BITMEX_CONTRACT_SIZE,
+        "order_qty_base": ORDER_QTY * BITMEX_CONTRACT_SIZE if not BITMEX_IS_INVERSE else None,
         "maker_fee_rate": MAKER_FEE_RATE,
         "taker_fee_rate": TAKER_FEE_RATE,
         "order_ttl_ms": ORDER_TTL_NS / 1_000_000.0,
@@ -692,8 +708,18 @@ def write_summary(result_npz: Path, metrics: np.ndarray, yyyymmdd: str, strategy
     final = records[-1]
     price = float(final["price"])
     final_contracts = float(final["position"])
-    final_base = final_contracts * BITMEX_CONTRACT_SIZE
-    equity_usdt = float(final["balance"]) + final_contracts * price * BITMEX_CONTRACT_SIZE - float(final["fee"])
+    if BITMEX_IS_INVERSE:
+        final_base = final_contracts * BITMEX_CONTRACT_SIZE / price if price > 0 else 0.0
+        fee_usdt = float(final["fee"]) * price
+        equity_btc = float(final["balance"]) + final_base - float(final["fee"])
+        equity_usdt = equity_btc * price
+        trading_value_key = "trading_value_btc"
+    else:
+        final_base = final_contracts * BITMEX_CONTRACT_SIZE
+        equity_usdt = float(final["balance"]) + final_contracts * price * BITMEX_CONTRACT_SIZE - float(final["fee"])
+        equity_btc = equity_usdt / price if price > 0 else 0.0
+        fee_usdt = float(final["fee"])
+        trading_value_key = "trading_value_usdt"
     total_pnl_usdt = equity_usdt
     avg_capture = metrics[18] / metrics[19] if metrics[19] > 0 else 0.0
     pnl_status = "profit" if total_pnl_usdt > 0 else "loss" if total_pnl_usdt < 0 else "flat"
@@ -708,7 +734,7 @@ def write_summary(result_npz: Path, metrics: np.ndarray, yyyymmdd: str, strategy
         "pnl_status": pnl_status,
         "pnl_status_zh": pnl_status_zh,
         "total_pnl_usdt": total_pnl_usdt,
-        "total_fee_usdt": float(final["fee"]),
+        "total_fee_usdt": fee_usdt,
         "total_filled_base": float(metrics[0]),
         "max_position_base": float(metrics[1]),
         "max_position_contracts_seen": float(metrics[2]),
@@ -739,11 +765,12 @@ def write_summary(result_npz: Path, metrics: np.ndarray, yyyymmdd: str, strategy
         "final_position_base": final_base,
         "final_flat": abs(final_contracts) < 1e-9,
         "equity_usdt": equity_usdt,
+        "equity_btc": equity_btc,
         "start_timestamp_ns": int(records[0]["timestamp"]),
         "end_timestamp_ns": int(final["timestamp"]),
         "records": int(len(records)),
         "num_trades": int(final["num_trades"]),
-        "trading_value_usdt": float(final["trading_value"]),
+        trading_value_key: float(final["trading_value"]),
     }
     summary_path = result_npz.with_suffix(".summary.json")
     report_path = result_npz.with_suffix(".report.md")
@@ -839,8 +866,16 @@ def render_report(summary: dict) -> str:
 
 def parse_args(strategy_mode: int) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=f"Backtest BitMEX XBTUSDT {strategy_name(strategy_mode)} single-market strategy."
+        description=f"Backtest BitMEX {strategy_name(strategy_mode)} single-market strategy."
     )
+    parser.add_argument("--symbol", default=BITMEX_SYMBOL, help="BitMEX symbol, e.g. XBTUSDT or XBTUSD.")
+    parser.add_argument(
+        "--asset-type",
+        choices=("linear", "inverse"),
+        default=None,
+        help="Contract type. Default: inverse for XBTUSD, linear otherwise.",
+    )
+    parser.add_argument("--contract-size", type=float, default=None, help="Override contract size.")
     parser.add_argument("--dates", nargs="+", default=list(DEFAULT_DATES), help="YYYYMMDD dates to run.")
     parser.add_argument("--skip-download", action="store_true", help="Use existing CSV/NPZ files only.")
     parser.add_argument("--buffer-rows", type=int, default=None, help="Override tardis conversion buffer rows.")
@@ -899,6 +934,17 @@ def apply_args(args: argparse.Namespace, strategy_mode: int) -> None:
     global LADDER_INVENTORY_SKEW_BPS_AT_SOFT_LIMIT
     global RESULT_TAG
     global CURRENT_STRATEGY_MODE
+    global BITMEX_SYMBOL
+    global BITMEX_CONTRACT_SIZE
+    global BITMEX_IS_INVERSE
+
+    BITMEX_SYMBOL = args.symbol.upper()
+    asset_type = args.asset_type or ("inverse" if BITMEX_SYMBOL == "XBTUSD" else "linear")
+    BITMEX_IS_INVERSE = asset_type == "inverse"
+    if args.contract_size is not None:
+        BITMEX_CONTRACT_SIZE = args.contract_size
+    elif BITMEX_IS_INVERSE:
+        BITMEX_CONTRACT_SIZE = 1.0
 
     BASE_HALF_SPREAD_BPS = args.base_half_spread_bps
     MIN_HALF_SPREAD_TICKS = args.min_half_spread_ticks
