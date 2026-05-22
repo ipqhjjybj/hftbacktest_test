@@ -26,6 +26,7 @@ Outputs are written to `results/factor_research/`:
 - `*.bucket_maker_edge.png`: approximate maker-edge bucket curves.
 - `*.fill_buckets.csv`: bucket statistics for hypothetical BBO fill probability and fill-conditioned edge.
 - `*.maker_fill_edge_buckets.csv`: side-aware maker fill edge table with latency, TTL, post-only, and queue assumptions.
+- `*.maker_fill_combo_rules.csv`: two-factor AND rule candidates, measured directly on the joint bucket, not inferred from separate one-factor buckets.
 - `*.bucket_fill_probability.png`: hypothetical BBO bid/ask fill probability by factor bucket.
 - `*.bucket_fill_edge.png`: fill-conditioned maker edge by factor bucket.
 - `*.lifecycle_fill_probability.png`: lifecycle maker fill probability by factor bucket.
@@ -48,3 +49,36 @@ best bid is marked filled only when future sell trade quantity within the
 horizon is greater than displayed bid quantity times `--queue-ahead-multiplier`
 plus `--hypothetical-order-qty`. Ask-side fill is symmetric with future buy
 trade quantity.
+
+## Edge Scoring
+
+The edge scoring layer turns the same factor/label data into continuous scores
+instead of fixed bucket rules. It trains separate ridge models for:
+
+- `bid_expected_edge_bps`
+- `ask_expected_edge_bps`
+- `bid_edge_if_filled_bps`
+- `ask_edge_if_filled_bps`
+- `bid_fill_prob`
+- `ask_fill_prob`
+
+Example train/predict run:
+
+```bash
+PYTHONPATH=py-hftbacktest .venv/bin/python scripts/bitmex_edge_score_train_predict.py \
+  --skip-download \
+  --train-start 20260505 \
+  --train-end 20260511 \
+  --test-start 20260512 \
+  --test-end 20260512 \
+  --maker-fee-rate 0.0 \
+  --horizon-ms 250 \
+  --result-tag edge_score_train7_test_20260512
+```
+
+Outputs:
+
+- `*.edge_model.json`: model coefficients, standardization stats, and train diagnostics.
+- `*.edge_score_summary.csv`: test-set edge/fill correlation and mean actual edge by side.
+- `*.edge_score_buckets.csv`: test-set score buckets; this is the first check that higher score buckets have better realized maker edge.
+- optional `*.edge_scores.npz`: timestamped predicted scores when `--write-scores` is set.
