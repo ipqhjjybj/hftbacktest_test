@@ -114,6 +114,95 @@ def bucket_rows(
     return rows
 
 
+def maker_fill_edge_bucket_rows(
+    factors: dict[str, np.ndarray],
+    labels: dict[str, np.ndarray],
+    factor_names: tuple[str, ...],
+    horizon_ms: int,
+    buckets: int,
+) -> list[dict[str, float | str | int]]:
+    rows: list[dict[str, float | str | int]] = []
+    side_specs = (
+        (
+            "bid",
+            "bid_lifecycle_fill_prob",
+            f"bid_lifecycle_edge_when_filled_{horizon_ms}ms_bps",
+            f"bid_lifecycle_expected_edge_{horizon_ms}ms_bps",
+            "bid_post_only_reject_prob",
+            "bid_entry_at_bbo_prob",
+            "bid_time_to_fill_ms",
+        ),
+        (
+            "ask",
+            "ask_lifecycle_fill_prob",
+            f"ask_lifecycle_edge_when_filled_{horizon_ms}ms_bps",
+            f"ask_lifecycle_expected_edge_{horizon_ms}ms_bps",
+            "ask_post_only_reject_prob",
+            "ask_entry_at_bbo_prob",
+            "ask_time_to_fill_ms",
+        ),
+    )
+    for factor_name in factor_names:
+        x = factors[factor_name]
+        factor_valid = np.isfinite(x)
+        xv = x[factor_valid]
+        if len(xv) < buckets * 10 or np.nanstd(xv) <= 0:
+            continue
+        edges = np.nanquantile(xv, np.linspace(0.0, 1.0, buckets + 1))
+        edges = np.unique(edges)
+        if len(edges) <= 2:
+            continue
+        bucket_id = np.searchsorted(edges[1:-1], x, side="right")
+        for b in range(len(edges) - 1):
+            base_mask = factor_valid & (bucket_id == b)
+            if int(base_mask.sum()) == 0:
+                continue
+            for (
+                side,
+                fill_label,
+                edge_label,
+                expected_label,
+                reject_label,
+                at_bbo_label,
+                time_label,
+            ) in side_specs:
+                fill = labels[fill_label]
+                edge = labels[edge_label]
+                expected = labels[expected_label]
+                reject = labels[reject_label]
+                at_bbo = labels[at_bbo_label]
+                time_to_fill = labels[time_label]
+                valid = base_mask & np.isfinite(fill) & np.isfinite(expected)
+                samples = int(valid.sum())
+                if samples == 0:
+                    continue
+                filled = valid & (fill > 0)
+                fill_samples = int(filled.sum())
+                edge_values = edge[filled]
+                edge_values = edge_values[np.isfinite(edge_values)]
+                time_values = time_to_fill[filled]
+                time_values = time_values[np.isfinite(time_values)]
+                row: dict[str, float | str | int] = {
+                    "factor": factor_name,
+                    "bucket": b + 1,
+                    "side": side,
+                    "samples": samples,
+                    "factor_min": float(np.nanmin(x[base_mask])),
+                    "factor_max": float(np.nanmax(x[base_mask])),
+                    "factor_mean": float(np.nanmean(x[base_mask])),
+                    "fill_samples": fill_samples,
+                    "fill_prob": float(np.nanmean(fill[valid])),
+                    "edge_if_filled_bps": float(np.nanmean(edge_values)) if len(edge_values) > 0 else float("nan"),
+                    "expected_edge_bps": float(np.nanmean(expected[valid])),
+                    "positive_fill_frac": float(np.nanmean(edge_values > 0)) if len(edge_values) > 0 else float("nan"),
+                    "mean_time_to_fill_ms": float(np.nanmean(time_values)) if len(time_values) > 0 else float("nan"),
+                    "post_only_reject_frac": float(np.nanmean(reject[valid])),
+                    "entry_at_bbo_frac": float(np.nanmean(at_bbo[valid])),
+                }
+                rows.append(row)
+    return rows
+
+
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:

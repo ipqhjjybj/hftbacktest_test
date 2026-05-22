@@ -281,3 +281,86 @@ def write_fill_charts(
         chart_paths["bucket_fill_edge"],
     )
     return chart_paths
+
+
+def plot_lifecycle_maker_metric(
+    bucket_rows: list[dict[str, object]],
+    factor_names: tuple[str, ...],
+    metric: str,
+    output_path: Path,
+    ylabel: str,
+    title: str,
+    multiplier: float = 1.0,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    groups: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for row in bucket_rows:
+        groups.setdefault((str(row["factor"]), str(row["side"])), []).append(row)
+    for rows in groups.values():
+        rows.sort(key=lambda item: int(item["bucket"]))
+
+    rows_count, cols = subplot_grid_size(len(factor_names))
+    fig, axes = plt.subplots(rows_count, cols, figsize=(cols * 4.2, rows_count * 3.0), constrained_layout=True)
+    axes_arr = np.atleast_1d(axes).ravel()
+    for ax, factor in zip(axes_arr, factor_names):
+        ax.axhline(0, color="#666666", linewidth=0.8)
+        for side, marker in (("bid", "o"), ("ask", "s")):
+            items = groups.get((factor, side), [])
+            x = np.array([int(row["bucket"]) for row in items], dtype=np.float64)
+            y = np.array([float(row[metric]) * multiplier for row in items], dtype=np.float64)
+            if len(x) > 0:
+                ax.plot(x, y, marker=marker, linewidth=1.4, label=side)
+        ax.set_title(factor)
+        ax.set_xlabel("factor bucket, low to high")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8)
+    for ax in axes_arr[len(factor_names) :]:
+        ax.axis("off")
+    fig.suptitle(title, fontsize=14)
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
+
+def write_lifecycle_fill_charts(
+    output_dir: Path,
+    prefix_name: str,
+    maker_fill_rows: list[dict[str, object]],
+    factor_names: tuple[str, ...],
+) -> dict[str, Path]:
+    setup_matplotlib_cache(output_dir / "mplconfig")
+    chart_paths = {
+        "lifecycle_fill_probability": output_dir / f"{prefix_name}.lifecycle_fill_probability.png",
+        "lifecycle_edge_if_filled": output_dir / f"{prefix_name}.lifecycle_edge_if_filled.png",
+        "lifecycle_expected_edge": output_dir / f"{prefix_name}.lifecycle_expected_edge.png",
+    }
+    plot_lifecycle_maker_metric(
+        maker_fill_rows,
+        factor_names,
+        "fill_prob",
+        chart_paths["lifecycle_fill_probability"],
+        "fill probability %",
+        "Lifecycle maker fill probability by factor bucket",
+        100.0,
+    )
+    plot_lifecycle_maker_metric(
+        maker_fill_rows,
+        factor_names,
+        "edge_if_filled_bps",
+        chart_paths["lifecycle_edge_if_filled"],
+        "edge if filled bps",
+        "Lifecycle maker edge if filled by factor bucket",
+    )
+    plot_lifecycle_maker_metric(
+        maker_fill_rows,
+        factor_names,
+        "expected_edge_bps",
+        chart_paths["lifecycle_expected_edge"],
+        "expected edge bps per quote opportunity",
+        "Lifecycle maker expected edge by factor bucket",
+    )
+    return chart_paths

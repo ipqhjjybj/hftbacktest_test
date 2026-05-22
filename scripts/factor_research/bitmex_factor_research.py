@@ -26,16 +26,18 @@ from bitmex_single_market_mm_backtest import (
     BITMEX_TICK_SIZE,
     CSV_DIR,
     NPZ_DIR,
+    ORDER_TTL_NS,
     convert_bitmex,
     download_file,
     end_close_ts_ns,
     tardis_key,
 )
 
-from factor_research.buckets import bucket_rows, factor_ic_rows, write_csv
+from factor_research.buckets import bucket_rows, factor_ic_rows, maker_fill_edge_bucket_rows, write_csv
 from factor_research.factors import FACTOR_NAMES, build_factor_frame
 from factor_research.labels import build_labels
-from factor_research.plots import write_charts, write_fill_charts
+from factor_research.maker_fill_labels import build_maker_fill_labels
+from factor_research.plots import write_charts, write_fill_charts, write_lifecycle_fill_charts
 from factor_research.report import render_report
 
 
@@ -145,6 +147,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--maker-fee-rate", type=float, default=-0.0002)
     parser.add_argument("--hypothetical-order-qty", type=float, default=100.0)
     parser.add_argument("--queue-ahead-multiplier", type=float, default=1.0)
+    parser.add_argument(
+        "--maker-fill-entry-latency-ms",
+        type=float,
+        default=BITMEX_ORDER_ENTRY_LATENCY_NS / 1_000_000.0,
+        help="Latency before a hypothetical maker quote reaches the book.",
+    )
+    parser.add_argument(
+        "--maker-fill-ttl-ms",
+        type=float,
+        default=ORDER_TTL_NS / 1_000_000.0,
+        help="Maximum lifetime of a hypothetical maker quote.",
+    )
     parser.add_argument("--max-samples-per-day", type=int, default=0)
     parser.add_argument("--result-tag", default="")
     parser.add_argument("--write-samples", action="store_true")
@@ -182,6 +196,17 @@ def main() -> None:
             args.hypothetical_order_qty,
             args.queue_ahead_multiplier,
         )
+        labels.update(
+            build_maker_fill_labels(
+                frame,
+                horizons_ms,
+                args.maker_fee_rate,
+                args.hypothetical_order_qty,
+                args.queue_ahead_multiplier,
+                args.maker_fill_entry_latency_ms,
+                args.maker_fill_ttl_ms,
+            )
+        )
         frames.append(frame)
         labels_list.append(labels)
 
@@ -215,14 +240,23 @@ def main() -> None:
         (fill_labels[1], fill_labels[2], fill_labels[3], fill_labels[4], fill_labels[5]),
         args.buckets,
     )
+    maker_fill_buckets = maker_fill_edge_bucket_rows(
+        data,
+        labels,
+        FACTOR_NAMES,
+        args.bucket_horizon_ms,
+        args.buckets,
+    )
 
     ic_path = prefix.with_suffix(".ic.csv")
     bucket_path = prefix.with_suffix(".buckets.csv")
     fill_bucket_path = prefix.with_suffix(".fill_buckets.csv")
+    maker_fill_bucket_path = prefix.with_suffix(".maker_fill_edge_buckets.csv")
     report_path = prefix.with_suffix(".report.md")
     write_csv(ic_path, ic)
     write_csv(bucket_path, buckets)
     write_csv(fill_bucket_path, fill_buckets)
+    write_csv(maker_fill_bucket_path, maker_fill_buckets)
     chart_files = write_charts(
         RESULT_DIR,
         prefix.name,
@@ -245,8 +279,21 @@ def main() -> None:
             fill_labels[3],
         )
     )
+    chart_files.update(
+        write_lifecycle_fill_charts(
+            RESULT_DIR,
+            prefix.name,
+            maker_fill_buckets,
+            FACTOR_NAMES,
+        )
+    )
 
-    output_files = {"ic_csv": ic_path, "bucket_csv": bucket_path, "fill_bucket_csv": fill_bucket_path}
+    output_files = {
+        "ic_csv": ic_path,
+        "bucket_csv": bucket_path,
+        "fill_bucket_csv": fill_bucket_path,
+        "maker_fill_edge_bucket_csv": maker_fill_bucket_path,
+    }
     if args.write_samples:
         sample_path = prefix.with_suffix(".samples.npz")
         np.savez_compressed(sample_path, **data, **labels)
@@ -260,6 +307,7 @@ def main() -> None:
         bucket_label,
         ic,
         buckets,
+        maker_fill_buckets,
         output_files,
         chart_files,
         report_path,
@@ -268,6 +316,7 @@ def main() -> None:
     print(f"wrote {ic_path}")
     print(f"wrote {bucket_path}")
     print(f"wrote {fill_bucket_path}")
+    print(f"wrote {maker_fill_bucket_path}")
     print(f"wrote {report_path}")
 
 

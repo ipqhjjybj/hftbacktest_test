@@ -25,12 +25,23 @@ Outputs are written to `results/factor_research/`:
 - `*.bucket_future_ret.png`: future-return bucket curves.
 - `*.bucket_maker_edge.png`: approximate maker-edge bucket curves.
 - `*.fill_buckets.csv`: bucket statistics for hypothetical BBO fill probability and fill-conditioned edge.
+- `*.maker_fill_edge_buckets.csv`: side-aware maker fill edge table with latency, TTL, post-only, and queue assumptions.
 - `*.bucket_fill_probability.png`: hypothetical BBO bid/ask fill probability by factor bucket.
 - `*.bucket_fill_edge.png`: fill-conditioned maker edge by factor bucket.
+- `*.lifecycle_fill_probability.png`: lifecycle maker fill probability by factor bucket.
+- `*.lifecycle_edge_if_filled.png`: lifecycle maker edge after modeled fills.
+- `*.lifecycle_expected_edge.png`: fill-probability-weighted lifecycle maker edge per quote opportunity.
 - optional `*.samples.npz`: sampled factor and label arrays when `--write-samples` is used.
 
-The first version samples order book state and recent trades. It does not yet
-simulate queue position, fill probability, or actual order lifecycle.
+The lifecycle fill layer is still a research approximation, but it adds:
+
+- order entry latency before the quote reaches the book,
+- post-only reject checks at the entry timestamp,
+- whether the quote is still at BBO or improves BBO,
+- displayed queue-ahead assumptions,
+- quote TTL,
+- fill detection from opposite-side active trade quantity,
+- edge measured from the modeled fill timestamp.
 
 The fill analysis uses a conservative simple rule: a hypothetical bid at current
 best bid is marked filled only when future sell trade quantity within the

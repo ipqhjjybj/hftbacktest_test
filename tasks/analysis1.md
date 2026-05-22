@@ -35,8 +35,21 @@
             i.  策略有多少容量、收益率？
             ii. 优化下单量吗?
 
+            iii. 要优化毒性信号， 也就是对信号做过滤
+                Gate 短时动量向不利方向时不挂
+                Gate microprice 偏弱时不挂 bid
+                BitMEX 被动成交前盘口突然变薄时撤
+                Gate book age 超过阈值时撤
+                Gate best bid/ask 快速跳动时暂停 quote
+
+
+                第一，信号不能只预测方向，要预测 toxic fill。
+                    比如 trade flow imbalance、microprice、短期 momentum、订单簿撤单速度、大单扫单后的残余方向，都要按 bid-fill 和 ask-fill 分开看。一个信号可能对 mid return
+                    有预测力，但对 maker fill 是负的，因为你只有被打中才成交。
+
 
         f. 趋势反转类的策略的话， 30分钟周期或者以上的，看着有希望盈利。 在maker fee 为0时。
+
 
 
     - 开发：双边都挂 maker，但不强制即时 hedge  的做市策略  
