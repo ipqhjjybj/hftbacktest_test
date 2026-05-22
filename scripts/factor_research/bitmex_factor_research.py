@@ -33,7 +33,13 @@ from bitmex_single_market_mm_backtest import (
     tardis_key,
 )
 
-from factor_research.buckets import bucket_rows, factor_ic_rows, maker_fill_edge_bucket_rows, write_csv
+from factor_research.buckets import (
+    bucket_rows,
+    factor_ic_rows,
+    maker_fill_combo_rule_rows,
+    maker_fill_edge_bucket_rows,
+    write_csv,
+)
 from factor_research.factors import FACTOR_NAMES, build_factor_frame
 from factor_research.labels import build_labels
 from factor_research.maker_fill_labels import build_maker_fill_labels
@@ -247,16 +253,26 @@ def main() -> None:
         args.bucket_horizon_ms,
         args.buckets,
     )
+    maker_fill_combo_rules = maker_fill_combo_rule_rows(
+        data,
+        labels,
+        FACTOR_NAMES,
+        args.bucket_horizon_ms,
+        args.buckets,
+        combo_size=2,
+    )
 
     ic_path = prefix.with_suffix(".ic.csv")
     bucket_path = prefix.with_suffix(".buckets.csv")
     fill_bucket_path = prefix.with_suffix(".fill_buckets.csv")
     maker_fill_bucket_path = prefix.with_suffix(".maker_fill_edge_buckets.csv")
+    maker_fill_combo_rule_path = prefix.with_suffix(".maker_fill_combo_rules.csv")
     report_path = prefix.with_suffix(".report.md")
     write_csv(ic_path, ic)
     write_csv(bucket_path, buckets)
     write_csv(fill_bucket_path, fill_buckets)
     write_csv(maker_fill_bucket_path, maker_fill_buckets)
+    write_csv(maker_fill_combo_rule_path, maker_fill_combo_rules)
     chart_files = write_charts(
         RESULT_DIR,
         prefix.name,
@@ -293,6 +309,7 @@ def main() -> None:
         "bucket_csv": bucket_path,
         "fill_bucket_csv": fill_bucket_path,
         "maker_fill_edge_bucket_csv": maker_fill_bucket_path,
+        "maker_fill_combo_rule_csv": maker_fill_combo_rule_path,
     }
     if args.write_samples:
         sample_path = prefix.with_suffix(".samples.npz")
@@ -317,6 +334,7 @@ def main() -> None:
     print(f"wrote {bucket_path}")
     print(f"wrote {fill_bucket_path}")
     print(f"wrote {maker_fill_bucket_path}")
+    print(f"wrote {maker_fill_combo_rule_path}")
     print(f"wrote {report_path}")
 
 

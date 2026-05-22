@@ -237,26 +237,20 @@ def factor_value(factor_id, depth, signal_ts, signal_bid, signal_ask, write_idx,
 
 
 @njit
-def match_rules(side, rule_factor_ids, rule_sides, rule_mins, rule_maxs, min_factor_matches, depth, signal_ts, signal_bid, signal_ask, write_idx, count, flow):
-    matched_factors = np.full(16, -1, dtype=np.int64)
-    matched_count = 0
-    for i in range(len(rule_factor_ids)):
+def match_rules(side, rule_factor_ids, rule_sides, rule_mins, rule_maxs, rule_leg_counts, depth, signal_ts, signal_bid, signal_ask, write_idx, count, flow):
+    for i in range(len(rule_sides)):
         if rule_sides[i] != side:
             continue
-        factor_id = rule_factor_ids[i]
-        value = factor_value(rule_factor_ids[i], depth, signal_ts, signal_bid, signal_ask, write_idx, count, flow)
-        if value >= rule_mins[i] and value <= rule_maxs[i]:
-            seen = False
-            for j in range(matched_count):
-                if matched_factors[j] == factor_id:
-                    seen = True
-                    break
-            if not seen:
-                matched_factors[matched_count] = factor_id
-                matched_count += 1
-                if matched_count >= min_factor_matches:
-                    return True, matched_count
-    return False, matched_count
+        matched = True
+        for leg in range(rule_leg_counts[i]):
+            factor_id = rule_factor_ids[i, leg]
+            value = factor_value(factor_id, depth, signal_ts, signal_bid, signal_ask, write_idx, count, flow)
+            if value < rule_mins[i, leg] or value > rule_maxs[i, leg]:
+                matched = False
+                break
+        if matched:
+            return True
+    return False
 
 
 @njit
@@ -265,20 +259,20 @@ def is_reduce_side(side, pos):
 
 
 @njit
-def should_quote(side, pos, rule_factor_ids, rule_sides, rule_mins, rule_maxs, min_factor_matches, depth, signal_ts, signal_bid, signal_ask, write_idx, count, flow):
+def should_quote(side, pos, rule_factor_ids, rule_sides, rule_mins, rule_maxs, rule_leg_counts, depth, signal_ts, signal_bid, signal_ask, write_idx, count, flow):
     if ORDER_QTY < BITMEX_LOT_SIZE:
         return False, 1
     if side > 0 and pos + ORDER_QTY > MAX_POSITION_CONTRACTS:
         return False, 2
     if side < 0 and pos - ORDER_QTY < -MAX_POSITION_CONTRACTS:
         return False, 2
-    matched, _ = match_rules(
+    matched = match_rules(
         side,
         rule_factor_ids,
         rule_sides,
         rule_mins,
         rule_maxs,
-        min_factor_matches,
+        rule_leg_counts,
         depth,
         signal_ts,
         signal_bid,
@@ -404,7 +398,7 @@ def force_flatten(hbt, metrics):
 
 
 @njit
-def run_strategy(hbt, recorder, metrics, end_close_ts, rule_factor_ids, rule_sides, rule_mins, rule_maxs, min_factor_matches):
+def run_strategy(hbt, recorder, metrics, end_close_ts, rule_factor_ids, rule_sides, rule_mins, rule_maxs, rule_leg_counts):
     bid_id = 11_001
     ask_id = 21_001
     bid_inflight_until = 0
@@ -447,7 +441,7 @@ def run_strategy(hbt, recorder, metrics, end_close_ts, rule_factor_ids, rule_sid
                 rule_sides,
                 rule_mins,
                 rule_maxs,
-                min_factor_matches,
+                rule_leg_counts,
                 depth,
                 signal_ts,
                 signal_bid,
@@ -463,7 +457,7 @@ def run_strategy(hbt, recorder, metrics, end_close_ts, rule_factor_ids, rule_sid
                 rule_sides,
                 rule_mins,
                 rule_maxs,
-                min_factor_matches,
+                rule_leg_counts,
                 depth,
                 signal_ts,
                 signal_bid,
@@ -565,12 +559,26 @@ def load_rules(
     min_fill_prob: float,
     min_fill_samples: int,
     max_rules_per_side: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[dict]]:
+    min_factor_matches: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[dict]]:
     rows = []
     with path.open() as file:
         for row in csv.DictReader(file):
-            factor = row["factor"]
-            if factor not in FACTOR_IDS:
+            factors: list[str]
+            mins: list[float]
+            maxs: list[float]
+            if "factor1" in row and row.get("factor1") and row.get("factor2"):
+                factors = [row["factor1"], row["factor2"]]
+                mins = [float(row["factor1_min"]), float(row["factor2_min"])]
+                maxs = [float(row["factor1_max"]), float(row["factor2_max"])]
+            else:
+                factor = row["factor"]
+                factors = [factor]
+                mins = [float(row["factor_min"])]
+                maxs = [float(row["factor_max"])]
+            if len(factors) < min_factor_matches:
+                continue
+            if any(factor not in FACTOR_IDS for factor in factors):
                 continue
             expected = float(row["expected_edge_bps"])
             edge = float(row["edge_if_filled_bps"])
@@ -586,12 +594,22 @@ def load_rules(
                 continue
             rows.append(
                 {
-                    "factor": factor,
-                    "factor_id": FACTOR_IDS[factor],
+                    "factor": "&".join(factors),
+                    "factors": factors,
+                    "factor_ids": [FACTOR_IDS[factor] for factor in factors],
+                    "factor_mins": mins,
+                    "factor_maxs": maxs,
+                    "factor_count": len(factors),
                     "side": row["side"],
                     "side_id": 1 if row["side"] == "bid" else -1,
-                    "factor_min": float(row["factor_min"]),
-                    "factor_max": float(row["factor_max"]),
+                    "factor_min": mins[0],
+                    "factor_max": maxs[0],
+                    "factor1": factors[0],
+                    "factor1_min": mins[0],
+                    "factor1_max": maxs[0],
+                    "factor2": factors[1] if len(factors) > 1 else "",
+                    "factor2_min": mins[1] if len(factors) > 1 else float("nan"),
+                    "factor2_max": maxs[1] if len(factors) > 1 else float("nan"),
                     "expected_edge_bps": expected,
                     "edge_if_filled_bps": edge,
                     "fill_prob": fill_prob,
@@ -606,18 +624,54 @@ def load_rules(
     selected.sort(key=lambda row: row["expected_edge_bps"], reverse=True)
     if not selected:
         raise ValueError(f"no rules selected from {path}")
+    max_legs = max(len(row["factor_ids"]) for row in selected)
+    rule_factor_ids = np.full((len(selected), max_legs), -1, dtype=np.int64)
+    rule_mins = np.full((len(selected), max_legs), np.nan, dtype=np.float64)
+    rule_maxs = np.full((len(selected), max_legs), np.nan, dtype=np.float64)
+    rule_leg_counts = np.zeros(len(selected), dtype=np.int64)
+    for row_idx, row in enumerate(selected):
+        factor_ids = row["factor_ids"]
+        mins = row["factor_mins"]
+        maxs = row["factor_maxs"]
+        rule_leg_counts[row_idx] = len(factor_ids)
+        for leg_idx, factor_id in enumerate(factor_ids):
+            rule_factor_ids[row_idx, leg_idx] = factor_id
+            rule_mins[row_idx, leg_idx] = mins[leg_idx]
+            rule_maxs[row_idx, leg_idx] = maxs[leg_idx]
     return (
-        np.array([row["factor_id"] for row in selected], dtype=np.int64),
+        rule_factor_ids,
         np.array([row["side_id"] for row in selected], dtype=np.int64),
-        np.array([row["factor_min"] for row in selected], dtype=np.float64),
-        np.array([row["factor_max"] for row in selected], dtype=np.float64),
+        rule_mins,
+        rule_maxs,
+        rule_leg_counts,
         selected,
     )
 
 
+def rule_factor_coverage(selected_rules: list[dict]) -> dict:
+    bid_factors = sorted({row["factor"] for row in selected_rules if row["side"] == "bid"})
+    ask_factors = sorted({row["factor"] for row in selected_rules if row["side"] == "ask"})
+    bid_atomic_factors = sorted({factor for row in selected_rules if row["side"] == "bid" for factor in row["factors"]})
+    ask_atomic_factors = sorted({factor for row in selected_rules if row["side"] == "ask" for factor in row["factors"]})
+    bid_rule_factors = [len(row["factors"]) for row in selected_rules if row["side"] == "bid"]
+    ask_rule_factors = [len(row["factors"]) for row in selected_rules if row["side"] == "ask"]
+    return {
+        "bid": bid_factors,
+        "ask": ask_factors,
+        "bid_count": len(bid_factors),
+        "ask_count": len(ask_factors),
+        "bid_atomic_factors": bid_atomic_factors,
+        "ask_atomic_factors": ask_atomic_factors,
+        "bid_atomic_count": len(bid_atomic_factors),
+        "ask_atomic_count": len(ask_atomic_factors),
+        "bid_max_rule_factors": max(bid_rule_factors) if bid_rule_factors else 0,
+        "ask_max_rule_factors": max(ask_rule_factors) if ask_rule_factors else 0,
+    }
+
+
 def run_backtest(bitmex_npz: Path, yyyymmdd: str, rules, min_factor_matches: int) -> Path:
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    rule_factor_ids, rule_sides, rule_mins, rule_maxs, selected_rules = rules
+    rule_factor_ids, rule_sides, rule_mins, rule_maxs, rule_leg_counts, selected_rules = rules
     hbt = HashMapMarketDepthBacktest([build_asset(bitmex_npz)])
     recorder = Recorder(1, 100_000)
     metrics = np.zeros(40, dtype=np.float64)
@@ -630,7 +684,7 @@ def run_backtest(bitmex_npz: Path, yyyymmdd: str, rules, min_factor_matches: int
         rule_sides,
         rule_mins,
         rule_maxs,
-        min_factor_matches,
+        rule_leg_counts,
     )
     if not ok:
         raise RuntimeError("strategy returned false")
@@ -658,6 +712,7 @@ def write_summary(result_npz: Path, yyyymmdd: str, selected_rules: list[dict], m
     total_fee = float(final["fee"])
     gross = equity + total_fee
     avg_capture = metrics[28] / metrics[29] if metrics[29] > 0 else 0.0
+    coverage = rule_factor_coverage(selected_rules)
     summary = {
         "date": yyyymmdd,
         "symbol": BITMEX_SYMBOL,
@@ -673,6 +728,18 @@ def write_summary(result_npz: Path, yyyymmdd: str, selected_rules: list[dict], m
         "rest_min_interval_ms": REST_MIN_INTERVAL_NS / 1_000_000.0,
         "selected_rules": len(selected_rules),
         "min_factor_matches": min_factor_matches,
+        "selected_bid_rule_count": coverage["bid_count"],
+        "selected_ask_rule_count": coverage["ask_count"],
+        "selected_bid_factor_count": coverage["bid_atomic_count"],
+        "selected_ask_factor_count": coverage["ask_atomic_count"],
+        "selected_bid_factors": ",".join(coverage["bid_atomic_factors"]),
+        "selected_ask_factors": ",".join(coverage["ask_atomic_factors"]),
+        "selected_bid_rules": ";".join(coverage["bid"]),
+        "selected_ask_rules": ";".join(coverage["ask"]),
+        "selected_bid_max_rule_factors": coverage["bid_max_rule_factors"],
+        "selected_ask_max_rule_factors": coverage["ask_max_rule_factors"],
+        "bid_factor_match_possible": coverage["bid_max_rule_factors"] >= min_factor_matches,
+        "ask_factor_match_possible": coverage["ask_max_rule_factors"] >= min_factor_matches,
         "total_pnl_usdt": equity,
         "gross_pnl_before_fee_usdt": gross,
         "fee_usdt": total_fee,
@@ -784,7 +851,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rest-min-interval-ms", type=float, default=REST_MIN_INTERVAL_NS / 1_000_000.0)
     parser.add_argument(
         "--rules-csv",
-        default="results/factor_research/bitmex_xbtusdt_maker_fill_edge_20260512_20260518_maker0.maker_fill_edge_buckets.csv",
+        default="results/factor_research/bitmex_xbtusdt_maker_fill_edge_20260512_20260518_maker0.maker_fill_combo_rules.csv",
     )
     parser.add_argument("--min-expected-edge-bps", type=float, default=0.02)
     parser.add_argument("--min-edge-if-filled-bps", type=float, default=0.25)
@@ -795,7 +862,7 @@ def parse_args() -> argparse.Namespace:
         "--min-factor-matches",
         type=int,
         default=1,
-        help="Require this many distinct selected factors to match on a side before quoting.",
+        help="Require selected rules to contain at least this many factor legs. Combo rule files encode AND conditions inside each rule.",
     )
     return parser.parse_args()
 
@@ -831,13 +898,36 @@ def main() -> None:
         args.min_fill_prob,
         args.min_fill_samples,
         args.max_rules_per_side,
+        args.min_factor_matches,
     )
-    print(f"selected_rules={len(rules[4])} from {args.rules_csv}")
-    for rule in rules[4]:
+    selected_rules = rules[5]
+    print(f"selected_rules={len(selected_rules)} from {args.rules_csv}")
+    coverage = rule_factor_coverage(selected_rules)
+    print(
+        "rule_factor_coverage "
+        f"bid_rules={coverage['bid_count']} max_legs={coverage['bid_max_rule_factors']} atomic={coverage['bid_atomic_factors']} "
+        f"ask_rules={coverage['ask_count']} max_legs={coverage['ask_max_rule_factors']} atomic={coverage['ask_atomic_factors']} "
+        f"required={args.min_factor_matches}"
+    )
+    if coverage["bid_max_rule_factors"] < args.min_factor_matches:
         print(
-            "rule side={side} factor={factor} range=[{factor_min:.6g},{factor_max:.6g}] "
-            "expected={expected_edge_bps:.6f} edge={edge_if_filled_bps:.6f} fill_prob={fill_prob:.6f}".format(
-                **rule
+            "WARNING: bid side cannot satisfy --min-factor-matches; "
+            "new bid quotes will be suppressed unless reducing an existing short position."
+        )
+    if coverage["ask_max_rule_factors"] < args.min_factor_matches:
+        print(
+            "WARNING: ask side cannot satisfy --min-factor-matches; "
+            "new ask quotes will be suppressed unless reducing an existing long position."
+        )
+    for rule in selected_rules:
+        legs = []
+        for factor, lo, hi in zip(rule["factors"], rule["factor_mins"], rule["factor_maxs"]):
+            legs.append(f"{factor}=[{lo:.6g},{hi:.6g}]")
+        print(
+            "rule side={side} legs={legs} expected={expected_edge_bps:.6f} "
+            "edge={edge_if_filled_bps:.6f} fill_prob={fill_prob:.6f}".format(
+                legs=" AND ".join(legs),
+                **rule,
             )
         )
 

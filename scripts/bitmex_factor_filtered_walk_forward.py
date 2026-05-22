@@ -90,11 +90,12 @@ def main() -> None:
         f"minmatch{args.min_factor_matches}_maker0_{args.exchange_model}"
     )
     rows = []
+    out = RESULT_DIR / f"bitmex_xbtusdt_factor_filtered_maker_{run_tag}.walk_forward.csv"
     for test_date in test_dates:
         train_dates = previous_dates(test_date, args.train_days)
         train_tag = f"{run_tag}_train_{train_dates[0]}_{train_dates[-1]}_test_{test_date}"
         factor_prefix = FACTOR_RESULT_DIR / f"bitmex_{args.symbol.lower()}_{train_tag}"
-        rules_csv = factor_prefix.with_suffix(".maker_fill_edge_buckets.csv")
+        rules_csv = factor_prefix.with_suffix(".maker_fill_combo_rules.csv")
 
         factor_cmd = [
             python,
@@ -167,15 +168,24 @@ def main() -> None:
                 "max_position_contracts_seen": summary["max_position_contracts_seen"],
                 "selected_rules": summary["selected_rules"],
                 "min_factor_matches": summary["min_factor_matches"],
+                "selected_bid_factor_count": summary.get("selected_bid_factor_count", ""),
+                "selected_ask_factor_count": summary.get("selected_ask_factor_count", ""),
+                "selected_bid_factors": summary.get("selected_bid_factors", ""),
+                "selected_ask_factors": summary.get("selected_ask_factors", ""),
+                "bid_factor_match_possible": summary.get("bid_factor_match_possible", ""),
+                "ask_factor_match_possible": summary.get("ask_factor_match_possible", ""),
+                "place_bid": summary.get("place_bid", ""),
+                "place_ask": summary.get("place_ask", ""),
+                "suppress_bid": summary.get("suppress_bid", ""),
+                "suppress_ask": summary.get("suppress_ask", ""),
                 "factor_gate_bid": summary["factor_gate_bid"],
                 "factor_gate_ask": summary["factor_gate_ask"],
                 "rules_csv": str(rules_csv),
                 "summary_json": str(summary_path),
             }
         )
+        write_csv(out, rows)
 
-    out = RESULT_DIR / f"bitmex_xbtusdt_factor_filtered_maker_{run_tag}.walk_forward.csv"
-    write_csv(out, rows)
     total_pnl = sum(float(row["total_pnl_usdt"]) for row in rows)
     total_gross = sum(float(row["gross_pnl_before_fee_usdt"]) for row in rows)
     total_fills = sum(int(row["fills"]) for row in rows)
