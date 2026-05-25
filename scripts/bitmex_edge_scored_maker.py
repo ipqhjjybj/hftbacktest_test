@@ -55,6 +55,13 @@ INVENTORY_SKEW_BPS_AT_SOFT_LIMIT = 4.0
 INVENTORY_SPREAD_BPS_AT_SOFT_LIMIT = 1.5
 SOFT_POSITION_CONTRACTS = 500.0
 MAX_POSITION_CONTRACTS = 1_000.0
+USE_DYNAMIC_QUOTE = False
+DYNAMIC_QUOTE_EXPECTED_EDGE_MULT = 1.0
+DYNAMIC_QUOTE_EDGE_IF_FILLED_MULT = 0.25
+DYNAMIC_QUOTE_MAX_TIGHTEN_BPS = 2.0
+DYNAMIC_QUOTE_FILL_PROB_WIDEN_MULT = 0.0
+DYNAMIC_QUOTE_FILL_PROB_BASELINE = 0.20
+DYNAMIC_QUOTE_MAX_WIDEN_BPS = 2.0
 
 MAKER_FEE_RATE = 0.0
 TAKER_FEE_RATE = 0.0001
@@ -63,6 +70,8 @@ RESULT_TAG = ""
 MIN_EXPECTED_EDGE_BPS = 0.02
 MIN_EDGE_IF_FILLED_BPS = -999.0
 MIN_FILL_PROB = 0.02
+MIN_PLACEMENT_EXPECTED_MARGIN_BPS = 0.0
+MIN_PLACEMENT_EDGE_IF_FILLED_MARGIN_BPS = 0.0
 USE_INTRADAY_PERCENTILE_GATE = False
 EXPECTED_EDGE_PERCENTILE = 0.0
 EDGE_IF_FILLED_PERCENTILE = 0.0
@@ -95,6 +104,19 @@ FACTOR_IDS = {
     "momentum_250ms_bps": 6,
     "momentum_1000ms_bps": 7,
     "vol_1000ms_bps": 8,
+    "depth_imbalance_3": 9,
+    "depth_imbalance_5": 10,
+    "weighted_depth_imbalance_5": 11,
+    "bid_depth_slope_5": 12,
+    "ask_depth_slope_5": 13,
+    "top_bid_qty_change": 14,
+    "top_ask_qty_change": 15,
+    "ofi": 16,
+    "ofi_1000ms": 17,
+    "trade_qty_1000ms": 18,
+    "trade_count_1000ms": 19,
+    "momentum_3000ms_bps": 20,
+    "vol_250ms_bps": 21,
 }
 
 MODEL_KEYS = (
@@ -105,6 +127,65 @@ MODEL_KEYS = (
     "bid_fill_prob",
     "ask_fill_prob",
 )
+
+FILL_ATTRIBUTION_FIELDS = [
+    "date",
+    "fill_index",
+    "timestamp_ns",
+    "side",
+    "fill_count",
+    "delta_contracts",
+    "position_before",
+    "position_after",
+    "exec_px",
+    "mid",
+    "spread_capture_usdt_per_btc",
+    "equity_usdt",
+    "equity_delta_since_prev_fill_usdt",
+    "bid_expected_edge_bps",
+    "ask_expected_edge_bps",
+    "bid_edge_if_filled_bps",
+    "ask_edge_if_filled_bps",
+    "bid_fill_prob",
+    "ask_fill_prob",
+    "side_expected_edge_bps",
+    "side_edge_if_filled_bps",
+    "side_fill_prob",
+    "side_expected_threshold_bps",
+    "side_edge_if_filled_threshold_bps",
+    "side_fill_prob_threshold",
+    "side_expected_margin_bps",
+    "side_edge_if_filled_margin_bps",
+    "side_fill_prob_margin",
+    "bid_regime_expected_edge_ewm_bps",
+    "ask_regime_expected_edge_ewm_bps",
+    "placement_valid",
+    "placement_action",
+    "placement_timestamp_ns",
+    "placement_age_ns",
+    "placement_target_px",
+    "placement_half_spread_bps",
+    "placement_position_contracts",
+    "placement_bid_expected_edge_bps",
+    "placement_ask_expected_edge_bps",
+    "placement_bid_edge_if_filled_bps",
+    "placement_ask_edge_if_filled_bps",
+    "placement_bid_fill_prob",
+    "placement_ask_fill_prob",
+    "placement_side_expected_edge_bps",
+    "placement_side_edge_if_filled_bps",
+    "placement_side_fill_prob",
+    "placement_side_expected_threshold_bps",
+    "placement_side_edge_if_filled_threshold_bps",
+    "placement_side_fill_prob_threshold",
+    "placement_side_expected_margin_bps",
+    "placement_side_edge_if_filled_margin_bps",
+    "placement_side_fill_prob_margin",
+    "placement_bid_regime_expected_edge_ewm_bps",
+    "placement_ask_regime_expected_edge_ewm_bps",
+]
+
+PLACEMENT_RECORD_LEN = 24
 
 
 @njit
@@ -148,13 +229,68 @@ def cancel_all_orders(hbt):
 
 
 @njit
-def record_signal(hbt, signal_ts, signal_bid, signal_ask, write_idx, count):
+def pair_ofi(bid, ask, bid_qty, ask_qty, prev_bid, prev_ask, prev_bid_qty, prev_ask_qty):
+    bid_part = 0.0
+    ask_part = 0.0
+    if bid > prev_bid:
+        bid_part = bid_qty
+    elif bid == prev_bid:
+        bid_part = bid_qty - prev_bid_qty
+    else:
+        bid_part = -prev_bid_qty
+
+    if ask < prev_ask:
+        ask_part = -ask_qty
+    elif ask == prev_ask:
+        ask_part = -(ask_qty - prev_ask_qty)
+    else:
+        ask_part = prev_ask_qty
+    return bid_part + ask_part
+
+
+@njit
+def record_signal(
+    hbt,
+    flow,
+    signal_ts,
+    signal_bid,
+    signal_ask,
+    signal_bid_qty,
+    signal_ask_qty,
+    signal_buy_qty,
+    signal_sell_qty,
+    signal_buy_count,
+    signal_sell_count,
+    signal_ofi,
+    write_idx,
+    count,
+):
     depth = hbt.depth(0)
     if depth.best_bid <= 0 or depth.best_ask <= 0:
         return write_idx, count
+    ofi = 0.0
+    if count > 0:
+        prev_idx = (write_idx - 1) % SIGNAL_HISTORY_LEN
+        ofi = pair_ofi(
+            depth.best_bid,
+            depth.best_ask,
+            depth.best_bid_qty,
+            depth.best_ask_qty,
+            signal_bid[prev_idx],
+            signal_ask[prev_idx],
+            signal_bid_qty[prev_idx],
+            signal_ask_qty[prev_idx],
+        )
     signal_ts[write_idx] = hbt.current_timestamp
     signal_bid[write_idx] = depth.best_bid
     signal_ask[write_idx] = depth.best_ask
+    signal_bid_qty[write_idx] = depth.best_bid_qty
+    signal_ask_qty[write_idx] = depth.best_ask_qty
+    signal_buy_qty[write_idx] = flow[2]
+    signal_sell_qty[write_idx] = flow[3]
+    signal_buy_count[write_idx] = flow[8]
+    signal_sell_count[write_idx] = flow[9]
+    signal_ofi[write_idx] = ofi
     write_idx = (write_idx + 1) % SIGNAL_HISTORY_LEN
     count = min(count + 1, SIGNAL_HISTORY_LEN)
     return write_idx, count
@@ -188,6 +324,57 @@ def recent_move_bps(signal_ts, signal_bid, signal_ask, write_idx, count, window_
 
 
 @njit
+def recent_qty_change(signal_ts, signal_qty, write_idx, count, window_ns):
+    if count <= 1:
+        return 0.0
+    cur_idx = (write_idx - 1) % SIGNAL_HISTORY_LEN
+    past_idx = signal_at_or_before(signal_ts, write_idx, count, signal_ts[cur_idx] - window_ns)
+    if past_idx < 0:
+        return 0.0
+    return signal_qty[cur_idx] - signal_qty[past_idx]
+
+
+@njit
+def rolling_signal_sum(signal_ts, signal_values, write_idx, count, window_ns):
+    if count <= 0:
+        return 0.0
+    cur_idx = (write_idx - 1) % SIGNAL_HISTORY_LEN
+    cutoff = signal_ts[cur_idx] - window_ns
+    total = 0.0
+    for offset in range(count):
+        idx = (write_idx - 1 - offset) % SIGNAL_HISTORY_LEN
+        if signal_ts[idx] < cutoff:
+            break
+        total += signal_values[idx]
+    return total
+
+
+@njit
+def recent_vol_bps(signal_ts, signal_bid, signal_ask, write_idx, count, window_ns):
+    if count <= 2:
+        return 0.0
+    cur_idx = (write_idx - 1) % SIGNAL_HISTORY_LEN
+    cutoff = signal_ts[cur_idx] - window_ns
+    total = 0.0
+    n = 0
+    prev_mid = 0.0
+    have_prev = False
+    for offset in range(count - 1, -1, -1):
+        idx = (write_idx - 1 - offset) % SIGNAL_HISTORY_LEN
+        if signal_ts[idx] < cutoff:
+            continue
+        mid = (signal_bid[idx] + signal_ask[idx]) / 2.0
+        if have_prev and prev_mid > 0:
+            total += abs(ratio_minus_one_bps(mid, prev_mid))
+            n += 1
+        prev_mid = mid
+        have_prev = True
+    if n <= 0:
+        return 0.0
+    return total / n
+
+
+@njit
 def microprice_bps(depth):
     mid = (depth.best_bid + depth.best_ask) / 2.0
     total_qty = depth.best_bid_qty + depth.best_ask_qty
@@ -203,6 +390,52 @@ def queue_imbalance(depth):
     if total_qty <= 0:
         return 0.0
     return (depth.best_bid_qty - depth.best_ask_qty) / total_qty
+
+
+@njit
+def depth_qty(depth, side, level):
+    if side > 0:
+        return depth.bid_qty_at_tick(depth.best_bid_tick - level)
+    return depth.ask_qty_at_tick(depth.best_ask_tick + level)
+
+
+@njit
+def depth_imbalance(depth, levels):
+    bid_total = 0.0
+    ask_total = 0.0
+    for level in range(levels):
+        bid_total += depth_qty(depth, 1, level)
+        ask_total += depth_qty(depth, -1, level)
+    total = bid_total + ask_total
+    if total <= 0:
+        return 0.0
+    return (bid_total - ask_total) / total
+
+
+@njit
+def weighted_depth_imbalance_5(depth):
+    bid_total = 0.0
+    ask_total = 0.0
+    for level in range(5):
+        weight = 1.0 / (level + 1.0)
+        bid_total += weight * depth_qty(depth, 1, level)
+        ask_total += weight * depth_qty(depth, -1, level)
+    total = bid_total + ask_total
+    if total <= 0:
+        return 0.0
+    return (bid_total - ask_total) / total
+
+
+@njit
+def depth_slope_5(depth, side):
+    top = depth_qty(depth, side, 0)
+    far = depth_qty(depth, side, 4)
+    total = 0.0
+    for level in range(5):
+        total += depth_qty(depth, side, level)
+    if total <= 0:
+        return 0.0
+    return (top - far) / total
 
 
 @njit
@@ -229,6 +462,8 @@ def update_trade_flow(hbt, flow):
     flow[5] += sell_qty
     flow[6] += buy_count
     flow[7] += sell_count
+    flow[8] = buy_count
+    flow[9] = sell_count
 
 
 @njit
@@ -247,7 +482,23 @@ def inventory_ratio(pos):
 
 
 @njit
-def factor_value(factor_id, depth, signal_ts, signal_bid, signal_ask, write_idx, count, flow):
+def factor_value(
+    factor_id,
+    depth,
+    signal_ts,
+    signal_bid,
+    signal_ask,
+    signal_bid_qty,
+    signal_ask_qty,
+    signal_buy_qty,
+    signal_sell_qty,
+    signal_buy_count,
+    signal_sell_count,
+    signal_ofi,
+    write_idx,
+    count,
+    flow,
+):
     if factor_id == 0:
         return ratio_minus_one_bps(depth.best_ask, depth.best_bid)
     if factor_id == 1:
@@ -266,17 +517,86 @@ def factor_value(factor_id, depth, signal_ts, signal_bid, signal_ask, write_idx,
         return recent_move_bps(signal_ts, signal_bid, signal_ask, write_idx, count, 1_000_000_000)
     if factor_id == 8:
         return abs(recent_move_bps(signal_ts, signal_bid, signal_ask, write_idx, count, 1_000_000_000))
+    if factor_id == 9:
+        return depth_imbalance(depth, 3)
+    if factor_id == 10:
+        return depth_imbalance(depth, 5)
+    if factor_id == 11:
+        return weighted_depth_imbalance_5(depth)
+    if factor_id == 12:
+        return depth_slope_5(depth, 1)
+    if factor_id == 13:
+        return depth_slope_5(depth, -1)
+    if factor_id == 14:
+        return recent_qty_change(signal_ts, signal_bid_qty, write_idx, count, 100_000_000)
+    if factor_id == 15:
+        return recent_qty_change(signal_ts, signal_ask_qty, write_idx, count, 100_000_000)
+    if factor_id == 16:
+        if count <= 0:
+            return 0.0
+        return signal_ofi[(write_idx - 1) % SIGNAL_HISTORY_LEN]
+    if factor_id == 17:
+        return rolling_signal_sum(signal_ts, signal_ofi, write_idx, count, 1_000_000_000)
+    if factor_id == 18:
+        return rolling_signal_sum(signal_ts, signal_buy_qty, write_idx, count, 1_000_000_000) + rolling_signal_sum(
+            signal_ts, signal_sell_qty, write_idx, count, 1_000_000_000
+        )
+    if factor_id == 19:
+        return rolling_signal_sum(signal_ts, signal_buy_count, write_idx, count, 1_000_000_000) + rolling_signal_sum(
+            signal_ts, signal_sell_count, write_idx, count, 1_000_000_000
+        )
+    if factor_id == 20:
+        return recent_move_bps(signal_ts, signal_bid, signal_ask, write_idx, count, 3_000_000_000)
+    if factor_id == 21:
+        return recent_vol_bps(signal_ts, signal_bid, signal_ask, write_idx, count, 250_000_000)
     return 0.0
 
 
 @njit
-def predict_scores(depth, signal_ts, signal_bid, signal_ask, write_idx, count, flow, model_mean, model_std, model_coef, include_interactions, clip_z):
-    raw = np.empty(9, dtype=np.float64)
-    for i in range(9):
-        raw[i] = factor_value(i, depth, signal_ts, signal_bid, signal_ask, write_idx, count, flow)
+def predict_scores(
+    depth,
+    signal_ts,
+    signal_bid,
+    signal_ask,
+    signal_bid_qty,
+    signal_ask_qty,
+    signal_buy_qty,
+    signal_sell_qty,
+    signal_buy_count,
+    signal_sell_count,
+    signal_ofi,
+    write_idx,
+    count,
+    flow,
+    model_mean,
+    model_std,
+    model_coef,
+    include_interactions,
+    clip_z,
+):
+    factor_count = len(model_mean)
+    raw = np.empty(factor_count, dtype=np.float64)
+    for i in range(factor_count):
+        raw[i] = factor_value(
+            i,
+            depth,
+            signal_ts,
+            signal_bid,
+            signal_ask,
+            signal_bid_qty,
+            signal_ask_qty,
+            signal_buy_qty,
+            signal_sell_qty,
+            signal_buy_count,
+            signal_sell_count,
+            signal_ofi,
+            write_idx,
+            count,
+            flow,
+        )
 
-    z = np.empty(9, dtype=np.float64)
-    for i in range(9):
+    z = np.empty(factor_count, dtype=np.float64)
+    for i in range(factor_count):
         value = (raw[i] - model_mean[i]) / model_std[i]
         if not math.isfinite(value):
             value = 0.0
@@ -288,15 +608,15 @@ def predict_scores(depth, signal_ts, signal_bid, signal_ask, write_idx, count, f
 
     features = np.empty(model_coef.shape[1] - 1, dtype=np.float64)
     idx = 0
-    for i in range(9):
+    for i in range(factor_count):
         features[idx] = z[i]
         idx += 1
-    for i in range(9):
+    for i in range(factor_count):
         features[idx] = z[i] * z[i]
         idx += 1
     if include_interactions:
-        for i in range(9):
-            for j in range(i + 1, 9):
+        for i in range(factor_count):
+            for j in range(i + 1, factor_count):
                 features[idx] = z[i] * z[j]
                 idx += 1
     while idx < len(features):
@@ -438,8 +758,8 @@ def should_quote(side, pos, scores, thresholds, risk_halt_new_entries, regime_ha
         edge_if_filled_threshold = thresholds[2]
         fill_prob_threshold = thresholds[4]
     matched = (
-        expected >= expected_threshold
-        and edge_if_filled >= edge_if_filled_threshold
+        expected >= expected_threshold + MIN_PLACEMENT_EXPECTED_MARGIN_BPS
+        and edge_if_filled >= edge_if_filled_threshold + MIN_PLACEMENT_EDGE_IF_FILLED_MARGIN_BPS
         and fill_prob >= fill_prob_threshold
     )
     if not matched and not reduce_side:
@@ -448,15 +768,51 @@ def should_quote(side, pos, scores, thresholds, risk_halt_new_entries, regime_ha
 
 
 @njit
-def target_price(side, depth, pos):
+def quote_half_spread_bps(side, depth, pos, scores, thresholds):
     mid = (depth.best_bid + depth.best_ask) / 2.0
     inv = inventory_ratio(pos)
     min_half_spread_bps = MIN_HALF_SPREAD_TICKS * BITMEX_TICK_SIZE / mid * 10_000.0
     vol_bps = 0.0
-    half_spread = max(
-        BASE_HALF_SPREAD_BPS + VOL_SPREAD_MULTIPLIER * vol_bps + abs(inv) * INVENTORY_SPREAD_BPS_AT_SOFT_LIMIT,
-        min_half_spread_bps,
-    )
+    half_spread = BASE_HALF_SPREAD_BPS + VOL_SPREAD_MULTIPLIER * vol_bps + abs(inv) * INVENTORY_SPREAD_BPS_AT_SOFT_LIMIT
+
+    if USE_DYNAMIC_QUOTE and not is_reduce_side(side, pos):
+        if side > 0:
+            expected = scores[0]
+            edge_if_filled = scores[2]
+            fill_prob = scores[4]
+            expected_threshold = thresholds[0]
+            edge_if_filled_threshold = thresholds[2]
+        else:
+            expected = scores[1]
+            edge_if_filled = scores[3]
+            fill_prob = scores[5]
+            expected_threshold = thresholds[1]
+            edge_if_filled_threshold = thresholds[3]
+
+        expected_margin = max(0.0, expected - expected_threshold)
+        edge_if_filled_margin = max(0.0, edge_if_filled - edge_if_filled_threshold)
+        tighten = (
+            DYNAMIC_QUOTE_EXPECTED_EDGE_MULT * expected_margin
+            + DYNAMIC_QUOTE_EDGE_IF_FILLED_MULT * edge_if_filled_margin
+        )
+        if tighten > DYNAMIC_QUOTE_MAX_TIGHTEN_BPS:
+            tighten = DYNAMIC_QUOTE_MAX_TIGHTEN_BPS
+
+        fill_prob_excess = max(0.0, fill_prob - DYNAMIC_QUOTE_FILL_PROB_BASELINE)
+        widen = DYNAMIC_QUOTE_FILL_PROB_WIDEN_MULT * fill_prob_excess
+        if widen > DYNAMIC_QUOTE_MAX_WIDEN_BPS:
+            widen = DYNAMIC_QUOTE_MAX_WIDEN_BPS
+
+        half_spread = half_spread - tighten + widen
+
+    return max(half_spread, min_half_spread_bps)
+
+
+@njit
+def target_price(side, depth, pos, scores, thresholds):
+    mid = (depth.best_bid + depth.best_ask) / 2.0
+    inv = inventory_ratio(pos)
+    half_spread = quote_half_spread_bps(side, depth, pos, scores, thresholds)
     anchor = mid * (1.0 - inv * INVENTORY_SKEW_BPS_AT_SOFT_LIMIT / 10_000.0)
     if side > 0:
         raw = anchor * (1.0 - half_spread / 10_000.0)
@@ -466,7 +822,63 @@ def target_price(side, depth, pos):
 
 
 @njit
-def manage_side(hbt, side, order_id, target_px, should_place, inflight_until, next_rest_allowed_ts, live_since, metrics):
+def update_placement_record(record, hbt, side, action, target_px, half_spread_bps, pos, scores, thresholds, metrics):
+    record[0] = 1.0
+    record[1] = action
+    record[2] = hbt.current_timestamp
+    record[3] = target_px
+    record[4] = half_spread_bps
+    record[5] = pos
+    record[6] = scores[0]
+    record[7] = scores[1]
+    record[8] = scores[2]
+    record[9] = scores[3]
+    record[10] = scores[4]
+    record[11] = scores[5]
+    if side > 0:
+        record[12] = scores[0]
+        record[13] = scores[2]
+        record[14] = scores[4]
+        record[15] = thresholds[0]
+        record[16] = thresholds[2]
+        record[17] = thresholds[4]
+    else:
+        record[12] = scores[1]
+        record[13] = scores[3]
+        record[14] = scores[5]
+        record[15] = thresholds[1]
+        record[16] = thresholds[3]
+        record[17] = thresholds[5]
+    record[18] = record[12] - record[15]
+    record[19] = record[13] - record[16]
+    record[20] = record[14] - record[17]
+    record[21] = metrics[57]
+    record[22] = metrics[58]
+    record[23] = side
+
+
+@njit
+def clear_placement_record(record):
+    for idx in range(PLACEMENT_RECORD_LEN):
+        record[idx] = 0.0
+
+
+@njit
+def manage_side(
+    hbt,
+    side,
+    order_id,
+    target_px,
+    target_half_spread_bps,
+    should_place,
+    inflight_until,
+    next_rest_allowed_ts,
+    live_since,
+    scores,
+    thresholds,
+    placement_record,
+    metrics,
+):
     if hbt.current_timestamp < inflight_until:
         return inflight_until, next_rest_allowed_ts, live_since
 
@@ -485,6 +897,7 @@ def manage_side(hbt, side, order_id, target_px, should_place, inflight_until, ne
                 metrics[rest_skip_metric] += 1
                 return inflight_until, next_rest_allowed_ts, live_since
             hbt.cancel(0, order_id, False)
+            clear_placement_record(placement_record)
             metrics[filter_cancel_metric] += 1
             return hbt.current_timestamp + ORDER_INFLIGHT_NS, hbt.current_timestamp + REST_MIN_INTERVAL_NS, 0
         return inflight_until, next_rest_allowed_ts, live_since
@@ -495,6 +908,7 @@ def manage_side(hbt, side, order_id, target_px, should_place, inflight_until, ne
                 metrics[rest_skip_metric] += 1
                 return inflight_until, next_rest_allowed_ts, live_since
             hbt.cancel(0, order_id, False)
+            clear_placement_record(placement_record)
             metrics[ttl_metric] += 1
             return hbt.current_timestamp + ORDER_INFLIGHT_NS, hbt.current_timestamp + REST_MIN_INTERVAL_NS, 0
         return inflight_until, next_rest_allowed_ts, live_since
@@ -506,6 +920,18 @@ def manage_side(hbt, side, order_id, target_px, should_place, inflight_until, ne
                 metrics[rest_skip_metric] += 1
                 return inflight_until, next_rest_allowed_ts, live_since
             hbt.modify(0, order_id, target_px, ORDER_QTY, False)
+            update_placement_record(
+                placement_record,
+                hbt,
+                side,
+                2.0,
+                target_px,
+                target_half_spread_bps,
+                hbt.position(0),
+                scores,
+                thresholds,
+                metrics,
+            )
             metrics[modify_metric] += 1
             return hbt.current_timestamp + ORDER_INFLIGHT_NS, hbt.current_timestamp + REST_MIN_INTERVAL_NS, hbt.current_timestamp
         return inflight_until, next_rest_allowed_ts, live_since
@@ -518,6 +944,18 @@ def manage_side(hbt, side, order_id, target_px, should_place, inflight_until, ne
         hbt.submit_buy_order(0, order_id, target_px, ORDER_QTY, GTX, LIMIT, False)
     else:
         hbt.submit_sell_order(0, order_id, target_px, ORDER_QTY, GTX, LIMIT, False)
+    update_placement_record(
+        placement_record,
+        hbt,
+        side,
+        1.0,
+        target_px,
+        target_half_spread_bps,
+        hbt.position(0),
+        scores,
+        thresholds,
+        metrics,
+    )
     metrics[place_metric] += 1
     return hbt.current_timestamp + ORDER_INFLIGHT_NS, hbt.current_timestamp + REST_MIN_INTERVAL_NS, hbt.current_timestamp
 
@@ -614,7 +1052,18 @@ def force_flatten(hbt, metrics):
 
 
 @njit
-def run_strategy(hbt, recorder, metrics, end_close_ts, model_mean, model_std, model_coef, include_interactions, clip_z):
+def run_strategy(
+    hbt,
+    recorder,
+    metrics,
+    fill_records,
+    end_close_ts,
+    model_mean,
+    model_std,
+    model_coef,
+    include_interactions,
+    clip_z,
+):
     bid_id = 11_001
     ask_id = 21_001
     bid_inflight_until = 0
@@ -626,11 +1075,20 @@ def run_strategy(hbt, recorder, metrics, end_close_ts, model_mean, model_std, mo
     last_pos = hbt.position(0)
     last_trades = hbt.state_values(0).num_trades
     last_trading_value = hbt.state_values(0).trading_value
+    last_fill_equity = 0.0
+    last_fill_equity_seen = False
 
-    flow = np.zeros(8, dtype=np.float64)
+    flow = np.zeros(10, dtype=np.float64)
     signal_ts = np.zeros(SIGNAL_HISTORY_LEN, dtype=np.int64)
     signal_bid = np.zeros(SIGNAL_HISTORY_LEN, dtype=np.float64)
     signal_ask = np.zeros(SIGNAL_HISTORY_LEN, dtype=np.float64)
+    signal_bid_qty = np.zeros(SIGNAL_HISTORY_LEN, dtype=np.float64)
+    signal_ask_qty = np.zeros(SIGNAL_HISTORY_LEN, dtype=np.float64)
+    signal_buy_qty = np.zeros(SIGNAL_HISTORY_LEN, dtype=np.float64)
+    signal_sell_qty = np.zeros(SIGNAL_HISTORY_LEN, dtype=np.float64)
+    signal_buy_count = np.zeros(SIGNAL_HISTORY_LEN, dtype=np.float64)
+    signal_sell_count = np.zeros(SIGNAL_HISTORY_LEN, dtype=np.float64)
+    signal_ofi = np.zeros(SIGNAL_HISTORY_LEN, dtype=np.float64)
     write_idx = 0
     count = 0
     hist_counts = np.zeros((6, PERCENTILE_BINS), dtype=np.int64)
@@ -646,6 +1104,20 @@ def run_strategy(hbt, recorder, metrics, end_close_ts, model_mean, model_std, mo
         ],
         dtype=np.float64,
     )
+    last_scores = np.zeros(6, dtype=np.float64)
+    last_score_thresholds = np.array(
+        [
+            MIN_EXPECTED_EDGE_BPS,
+            MIN_EXPECTED_EDGE_BPS,
+            MIN_EDGE_IF_FILLED_BPS,
+            MIN_EDGE_IF_FILLED_BPS,
+            MIN_FILL_PROB,
+            MIN_FILL_PROB,
+        ],
+        dtype=np.float64,
+    )
+    bid_placement_record = np.zeros(PLACEMENT_RECORD_LEN, dtype=np.float64)
+    ask_placement_record = np.zeros(PLACEMENT_RECORD_LEN, dtype=np.float64)
     last_percentile_update_ts = 0
 
     while hbt.elapse(ORDER_UPDATE_INTERVAL_NS) == 0:
@@ -657,11 +1129,28 @@ def run_strategy(hbt, recorder, metrics, end_close_ts, model_mean, model_std, mo
         metrics[25] = flow[5]
         metrics[26] = flow[6]
         metrics[27] = flow[7]
-        write_idx, count = record_signal(hbt, signal_ts, signal_bid, signal_ask, write_idx, count)
+        write_idx, count = record_signal(
+            hbt,
+            flow,
+            signal_ts,
+            signal_bid,
+            signal_ask,
+            signal_bid_qty,
+            signal_ask_qty,
+            signal_buy_qty,
+            signal_sell_qty,
+            signal_buy_count,
+            signal_sell_count,
+            signal_ofi,
+            write_idx,
+            count,
+        )
 
         depth = hbt.depth(0)
         if depth.best_bid <= 0 or depth.best_ask <= 0:
             cancel_all_orders(hbt)
+            clear_placement_record(bid_placement_record)
+            clear_placement_record(ask_placement_record)
         else:
             pos = hbt.position(0)
             scores = predict_scores(
@@ -669,6 +1158,13 @@ def run_strategy(hbt, recorder, metrics, end_close_ts, model_mean, model_std, mo
                 signal_ts,
                 signal_bid,
                 signal_ask,
+                signal_bid_qty,
+                signal_ask_qty,
+                signal_buy_qty,
+                signal_sell_qty,
+                signal_buy_count,
+                signal_sell_count,
+                signal_ofi,
                 write_idx,
                 count,
                 flow,
@@ -685,6 +1181,8 @@ def run_strategy(hbt, recorder, metrics, end_close_ts, model_mean, model_std, mo
             metrics[34] += scores[4]
             metrics[35] += scores[5]
             metrics[36] += 1
+            for score_idx in range(6):
+                last_scores[score_idx] = scores[score_idx]
             if USE_INTRADAY_PERCENTILE_GATE:
                 if (
                     PERCENTILE_UPDATE_INTERVAL_NS <= 0
@@ -708,6 +1206,8 @@ def run_strategy(hbt, recorder, metrics, end_close_ts, model_mean, model_std, mo
                 metrics[44] += score_thresholds[4]
                 metrics[45] += score_thresholds[5]
                 metrics[46] += 1
+            for score_idx in range(6):
+                last_score_thresholds[score_idx] = score_thresholds[score_idx]
             update_risk_metrics(hbt, metrics)
             risk_halt = risk_halt_new_entries(metrics)
             bid_regime_halt, ask_regime_halt = update_regime_expected_edge_gate(scores, metrics)
@@ -730,28 +1230,43 @@ def run_strategy(hbt, recorder, metrics, end_close_ts, model_mean, model_std, mo
             elif ask_ok:
                 metrics[39] += 1
 
-            bid_px = target_price(1, depth, pos)
+            bid_half_spread = quote_half_spread_bps(1, depth, pos, scores, score_thresholds)
+            ask_half_spread = quote_half_spread_bps(-1, depth, pos, scores, score_thresholds)
+            metrics[65] += bid_half_spread
+            metrics[66] += ask_half_spread
+            metrics[67] += 1
+            metrics[68] += 1
+
+            bid_px = target_price(1, depth, pos, scores, score_thresholds)
             bid_inflight_until, next_rest_allowed_ts, bid_live_since = manage_side(
                 hbt,
                 1,
                 bid_id,
                 bid_px,
+                bid_half_spread,
                 bid_ok,
                 bid_inflight_until,
                 next_rest_allowed_ts,
                 bid_live_since,
+                scores,
+                score_thresholds,
+                bid_placement_record,
                 metrics,
             )
-            ask_px = target_price(-1, depth, pos)
+            ask_px = target_price(-1, depth, pos, scores, score_thresholds)
             ask_inflight_until, next_rest_allowed_ts, ask_live_since = manage_side(
                 hbt,
                 -1,
                 ask_id,
                 ask_px,
+                ask_half_spread,
                 ask_ok,
                 ask_inflight_until,
                 next_rest_allowed_ts,
                 ask_live_since,
+                scores,
+                score_thresholds,
+                ask_placement_record,
                 metrics,
             )
 
@@ -778,6 +1293,106 @@ def run_strategy(hbt, recorder, metrics, end_close_ts, model_mean, model_std, mo
                     if exec_px > 0:
                         metrics[28] += exec_px - mid
                         metrics[29] += 1
+                fill_record_idx = int(metrics[64])
+                if fill_record_idx < fill_records.shape[0]:
+                    side = 0.0
+                    spread_capture = 0.0
+                    side_expected = 0.0
+                    side_edge_if_filled = 0.0
+                    side_fill_prob = 0.0
+                    side_expected_threshold = 0.0
+                    side_edge_if_filled_threshold = 0.0
+                    side_fill_prob_threshold = 0.0
+                    if delta_contracts > 0:
+                        side = 1.0
+                        if exec_px > 0:
+                            spread_capture = mid - exec_px
+                        side_expected = last_scores[0]
+                        side_edge_if_filled = last_scores[2]
+                        side_fill_prob = last_scores[4]
+                        side_expected_threshold = last_score_thresholds[0]
+                        side_edge_if_filled_threshold = last_score_thresholds[2]
+                        side_fill_prob_threshold = last_score_thresholds[4]
+                    elif delta_contracts < 0:
+                        side = -1.0
+                        if exec_px > 0:
+                            spread_capture = exec_px - mid
+                        side_expected = last_scores[1]
+                        side_edge_if_filled = last_scores[3]
+                        side_fill_prob = last_scores[5]
+                        side_expected_threshold = last_score_thresholds[1]
+                        side_edge_if_filled_threshold = last_score_thresholds[3]
+                        side_fill_prob_threshold = last_score_thresholds[5]
+                    equity = bitmex_equity_usdt(hbt)
+                    if last_fill_equity_seen:
+                        equity_delta = equity - last_fill_equity
+                    elif metrics[47] > 0.0:
+                        equity_delta = equity - metrics[48]
+                    else:
+                        equity_delta = 0.0
+                    last_fill_equity = equity
+                    last_fill_equity_seen = True
+
+                    fill_records[fill_record_idx, 0] = hbt.current_timestamp
+                    fill_records[fill_record_idx, 1] = side
+                    fill_records[fill_record_idx, 2] = fill_count
+                    fill_records[fill_record_idx, 3] = delta_contracts
+                    fill_records[fill_record_idx, 4] = last_pos
+                    fill_records[fill_record_idx, 5] = state.position
+                    fill_records[fill_record_idx, 6] = exec_px
+                    fill_records[fill_record_idx, 7] = mid
+                    fill_records[fill_record_idx, 8] = spread_capture
+                    fill_records[fill_record_idx, 9] = equity
+                    fill_records[fill_record_idx, 10] = equity_delta
+                    fill_records[fill_record_idx, 11] = last_scores[0]
+                    fill_records[fill_record_idx, 12] = last_scores[1]
+                    fill_records[fill_record_idx, 13] = last_scores[2]
+                    fill_records[fill_record_idx, 14] = last_scores[3]
+                    fill_records[fill_record_idx, 15] = last_scores[4]
+                    fill_records[fill_record_idx, 16] = last_scores[5]
+                    fill_records[fill_record_idx, 17] = side_expected
+                    fill_records[fill_record_idx, 18] = side_edge_if_filled
+                    fill_records[fill_record_idx, 19] = side_fill_prob
+                    fill_records[fill_record_idx, 20] = side_expected_threshold
+                    fill_records[fill_record_idx, 21] = side_edge_if_filled_threshold
+                    fill_records[fill_record_idx, 22] = side_fill_prob_threshold
+                    fill_records[fill_record_idx, 23] = side_expected - side_expected_threshold
+                    fill_records[fill_record_idx, 24] = side_edge_if_filled - side_edge_if_filled_threshold
+                    fill_records[fill_record_idx, 25] = side_fill_prob - side_fill_prob_threshold
+                    fill_records[fill_record_idx, 26] = metrics[57]
+                    fill_records[fill_record_idx, 27] = metrics[58]
+                    if delta_contracts > 0:
+                        placement = bid_placement_record
+                    else:
+                        placement = ask_placement_record
+                    placement_age = 0.0
+                    if placement[0] > 0.0:
+                        placement_age = hbt.current_timestamp - placement[2]
+                    fill_records[fill_record_idx, 28] = placement[0]
+                    fill_records[fill_record_idx, 29] = placement[1]
+                    fill_records[fill_record_idx, 30] = placement[2]
+                    fill_records[fill_record_idx, 31] = placement_age
+                    fill_records[fill_record_idx, 32] = placement[3]
+                    fill_records[fill_record_idx, 33] = placement[4]
+                    fill_records[fill_record_idx, 34] = placement[5]
+                    fill_records[fill_record_idx, 35] = placement[6]
+                    fill_records[fill_record_idx, 36] = placement[7]
+                    fill_records[fill_record_idx, 37] = placement[8]
+                    fill_records[fill_record_idx, 38] = placement[9]
+                    fill_records[fill_record_idx, 39] = placement[10]
+                    fill_records[fill_record_idx, 40] = placement[11]
+                    fill_records[fill_record_idx, 41] = placement[12]
+                    fill_records[fill_record_idx, 42] = placement[13]
+                    fill_records[fill_record_idx, 43] = placement[14]
+                    fill_records[fill_record_idx, 44] = placement[15]
+                    fill_records[fill_record_idx, 45] = placement[16]
+                    fill_records[fill_record_idx, 46] = placement[17]
+                    fill_records[fill_record_idx, 47] = placement[18]
+                    fill_records[fill_record_idx, 48] = placement[19]
+                    fill_records[fill_record_idx, 49] = placement[20]
+                    fill_records[fill_record_idx, 50] = placement[21]
+                    fill_records[fill_record_idx, 51] = placement[22]
+                    metrics[64] += 1
             last_pos = state.position
             last_trades = state.num_trades
             last_trading_value = state.trading_value
@@ -832,7 +1447,8 @@ def load_edge_model(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, boo
     std = np.array(model["std"], dtype=np.float64)
     include_interactions = bool(model.get("include_interactions", True))
     clip_z = float(model.get("clip_z", 6.0))
-    feature_len = 18 + (36 if include_interactions else 0)
+    factor_count = len(mean)
+    feature_len = factor_count * 2 + (factor_count * (factor_count - 1) // 2 if include_interactions else 0)
     coef = np.zeros((6, feature_len + 1), dtype=np.float64)
     for idx, key in enumerate(MODEL_KEYS):
         item = model.get("models", {}).get(key)
@@ -967,10 +1583,12 @@ def run_backtest(bitmex_npz: Path, yyyymmdd: str, model_path: Path) -> Path:
     hbt = HashMapMarketDepthBacktest([build_asset(bitmex_npz)])
     recorder = Recorder(1, 100_000)
     metrics = np.zeros(72, dtype=np.float64)
+    fill_records = np.zeros((20_000, len(FILL_ATTRIBUTION_FIELDS) - 2), dtype=np.float64)
     ok = run_strategy(
         hbt,
         recorder.recorder,
         metrics,
+        fill_records,
         end_close_ts_ns(yyyymmdd),
         model_mean,
         model_std,
@@ -983,8 +1601,10 @@ def run_backtest(bitmex_npz: Path, yyyymmdd: str, model_path: Path) -> Path:
 
     tag = RESULT_TAG or f"edge_scored_{EXCHANGE_MODEL}"
     out = RESULT_DIR / f"bitmex_xbtusdt_edge_scored_maker_{tag}_{yyyymmdd}.npz"
-    np.savez_compressed(out, **{"0": recorder.get(0), "metrics": metrics})
+    fill_count = int(metrics[64])
+    np.savez_compressed(out, **{"0": recorder.get(0), "metrics": metrics, "fill_records": fill_records[:fill_count]})
     write_summary(out, yyyymmdd, model_path, model)
+    write_fill_attribution(out, yyyymmdd)
     return out
 
 
@@ -1007,6 +1627,8 @@ def write_summary(result_npz: Path, yyyymmdd: str, model_path: Path, model: dict
     score_samples = metrics[36] if metrics[36] > 0 else 1.0
     threshold_samples = metrics[46] if metrics[46] > 0 else 1.0
     regime_samples = metrics[59] if metrics[59] > 0 else 1.0
+    bid_quote_samples = metrics[67] if metrics[67] > 0 else 1.0
+    ask_quote_samples = metrics[68] if metrics[68] > 0 else 1.0
     summary = {
         "date": yyyymmdd,
         "symbol": BITMEX_SYMBOL,
@@ -1018,6 +1640,13 @@ def write_summary(result_npz: Path, yyyymmdd: str, model_path: Path, model: dict
         "base_half_spread_bps": BASE_HALF_SPREAD_BPS,
         "max_position_contracts": MAX_POSITION_CONTRACTS,
         "soft_position_contracts": SOFT_POSITION_CONTRACTS,
+        "dynamic_quote": USE_DYNAMIC_QUOTE,
+        "dynamic_quote_expected_edge_mult": DYNAMIC_QUOTE_EXPECTED_EDGE_MULT,
+        "dynamic_quote_edge_if_filled_mult": DYNAMIC_QUOTE_EDGE_IF_FILLED_MULT,
+        "dynamic_quote_max_tighten_bps": DYNAMIC_QUOTE_MAX_TIGHTEN_BPS,
+        "dynamic_quote_fill_prob_widen_mult": DYNAMIC_QUOTE_FILL_PROB_WIDEN_MULT,
+        "dynamic_quote_fill_prob_baseline": DYNAMIC_QUOTE_FILL_PROB_BASELINE,
+        "dynamic_quote_max_widen_bps": DYNAMIC_QUOTE_MAX_WIDEN_BPS,
         "order_ttl_ms": ORDER_TTL_NS / 1_000_000.0,
         "rest_min_interval_ms": REST_MIN_INTERVAL_NS / 1_000_000.0,
         "model_path": str(model_path),
@@ -1025,6 +1654,8 @@ def write_summary(result_npz: Path, yyyymmdd: str, model_path: Path, model: dict
         "min_expected_edge_bps": MIN_EXPECTED_EDGE_BPS,
         "min_edge_if_filled_bps": MIN_EDGE_IF_FILLED_BPS,
         "min_fill_prob": MIN_FILL_PROB,
+        "min_placement_expected_margin_bps": MIN_PLACEMENT_EXPECTED_MARGIN_BPS,
+        "min_placement_edge_if_filled_margin_bps": MIN_PLACEMENT_EDGE_IF_FILLED_MARGIN_BPS,
         "reduce_only_after_soft_position": REDUCE_ONLY_AFTER_SOFT_POSITION,
         "daily_loss_limit_usdt": DAILY_LOSS_LIMIT_USDT,
         "daily_fill_limit": DAILY_FILL_LIMIT,
@@ -1101,6 +1732,8 @@ def write_summary(result_npz: Path, yyyymmdd: str, model_path: Path, model: dict
         "avg_gate_ask_edge_if_filled_bps": float(metrics[43] / threshold_samples),
         "avg_gate_bid_fill_prob": float(metrics[44] / threshold_samples),
         "avg_gate_ask_fill_prob": float(metrics[45] / threshold_samples),
+        "avg_quote_bid_half_spread_bps": float(metrics[65] / bid_quote_samples),
+        "avg_quote_ask_half_spread_bps": float(metrics[66] / ask_quote_samples),
         "final_position_contracts": final_pos,
         "final_position_btc": final_pos * BITMEX_CONTRACT_SIZE,
         "records": int(len(records)),
@@ -1137,12 +1770,86 @@ def render_console_summary(summary: dict) -> str:
                 f"bid_fill={summary['avg_gate_bid_fill_prob']:.4f}, "
                 f"ask_fill={summary['avg_gate_ask_fill_prob']:.4f}"
             ),
+            (
+                "avg quote half-spread: "
+                f"bid={summary['avg_quote_bid_half_spread_bps']:.4f}bps, "
+                f"ask={summary['avg_quote_ask_half_spread_bps']:.4f}bps"
+            ),
             f"filter cancel: bid={summary['filter_cancel_bid']}, ask={summary['filter_cancel_ask']}",
             f"avg capture: {summary['avg_spread_capture_usdt_per_btc']:,.4f} USDT/BTC",
             "=======================================================",
             "",
         ]
     )
+
+
+def write_fill_attribution(result_npz: Path, yyyymmdd: str) -> Path:
+    data = np.load(result_npz)
+    rows = data["fill_records"] if "fill_records" in data else np.zeros((0, len(FILL_ATTRIBUTION_FIELDS) - 2))
+    out = result_npz.with_suffix(".fills.csv")
+    with out.open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=FILL_ATTRIBUTION_FIELDS)
+        writer.writeheader()
+        for idx, values in enumerate(rows):
+            writer.writerow(
+                {
+                    "date": yyyymmdd,
+                    "fill_index": idx,
+                    "timestamp_ns": int(values[0]),
+                    "side": "bid" if values[1] > 0 else "ask" if values[1] < 0 else "",
+                    "fill_count": int(values[2]),
+                    "delta_contracts": values[3],
+                    "position_before": values[4],
+                    "position_after": values[5],
+                    "exec_px": values[6],
+                    "mid": values[7],
+                    "spread_capture_usdt_per_btc": values[8],
+                    "equity_usdt": values[9],
+                    "equity_delta_since_prev_fill_usdt": values[10],
+                    "bid_expected_edge_bps": values[11],
+                    "ask_expected_edge_bps": values[12],
+                    "bid_edge_if_filled_bps": values[13],
+                    "ask_edge_if_filled_bps": values[14],
+                    "bid_fill_prob": values[15],
+                    "ask_fill_prob": values[16],
+                    "side_expected_edge_bps": values[17],
+                    "side_edge_if_filled_bps": values[18],
+                    "side_fill_prob": values[19],
+                    "side_expected_threshold_bps": values[20],
+                    "side_edge_if_filled_threshold_bps": values[21],
+                    "side_fill_prob_threshold": values[22],
+                    "side_expected_margin_bps": values[23],
+                    "side_edge_if_filled_margin_bps": values[24],
+                    "side_fill_prob_margin": values[25],
+                    "bid_regime_expected_edge_ewm_bps": values[26],
+                    "ask_regime_expected_edge_ewm_bps": values[27],
+                    "placement_valid": int(values[28]),
+                    "placement_action": "submit" if values[29] == 1.0 else "modify" if values[29] == 2.0 else "",
+                    "placement_timestamp_ns": int(values[30]),
+                    "placement_age_ns": int(values[31]),
+                    "placement_target_px": values[32],
+                    "placement_half_spread_bps": values[33],
+                    "placement_position_contracts": values[34],
+                    "placement_bid_expected_edge_bps": values[35],
+                    "placement_ask_expected_edge_bps": values[36],
+                    "placement_bid_edge_if_filled_bps": values[37],
+                    "placement_ask_edge_if_filled_bps": values[38],
+                    "placement_bid_fill_prob": values[39],
+                    "placement_ask_fill_prob": values[40],
+                    "placement_side_expected_edge_bps": values[41],
+                    "placement_side_edge_if_filled_bps": values[42],
+                    "placement_side_fill_prob": values[43],
+                    "placement_side_expected_threshold_bps": values[44],
+                    "placement_side_edge_if_filled_threshold_bps": values[45],
+                    "placement_side_fill_prob_threshold": values[46],
+                    "placement_side_expected_margin_bps": values[47],
+                    "placement_side_edge_if_filled_margin_bps": values[48],
+                    "placement_side_fill_prob_margin": values[49],
+                    "placement_bid_regime_expected_edge_ewm_bps": values[50],
+                    "placement_ask_regime_expected_edge_ewm_bps": values[51],
+                }
+            )
+    return out
 
 
 def write_aggregate(summaries: list[dict]) -> Path:
@@ -1159,6 +1866,15 @@ def write_aggregate(summaries: list[dict]) -> Path:
         "filled_base_btc",
         "max_position_contracts_seen",
         "reduce_only_after_soft_position",
+        "dynamic_quote",
+        "dynamic_quote_expected_edge_mult",
+        "dynamic_quote_edge_if_filled_mult",
+        "dynamic_quote_max_tighten_bps",
+        "dynamic_quote_fill_prob_widen_mult",
+        "dynamic_quote_fill_prob_baseline",
+        "dynamic_quote_max_widen_bps",
+        "min_placement_expected_margin_bps",
+        "min_placement_edge_if_filled_margin_bps",
         "daily_loss_limit_usdt",
         "daily_fill_limit",
         "regime_expected_edge_gate",
@@ -1180,6 +1896,8 @@ def write_aggregate(summaries: list[dict]) -> Path:
         "avg_gate_ask_edge_if_filled_bps",
         "avg_gate_bid_fill_prob",
         "avg_gate_ask_fill_prob",
+        "avg_quote_bid_half_spread_bps",
+        "avg_quote_ask_half_spread_bps",
         "filter_cancel_bid",
         "filter_cancel_ask",
         "avg_spread_capture_usdt_per_btc",
@@ -1213,6 +1931,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--maker-fee-rate", type=float, default=MAKER_FEE_RATE)
     parser.add_argument("--taker-fee-rate", type=float, default=TAKER_FEE_RATE)
     parser.add_argument("--base-half-spread-bps", type=float, default=BASE_HALF_SPREAD_BPS)
+    parser.add_argument("--dynamic-quote", action="store_true")
+    parser.add_argument("--dynamic-quote-expected-edge-mult", type=float, default=DYNAMIC_QUOTE_EXPECTED_EDGE_MULT)
+    parser.add_argument("--dynamic-quote-edge-if-filled-mult", type=float, default=DYNAMIC_QUOTE_EDGE_IF_FILLED_MULT)
+    parser.add_argument("--dynamic-quote-max-tighten-bps", type=float, default=DYNAMIC_QUOTE_MAX_TIGHTEN_BPS)
+    parser.add_argument("--dynamic-quote-fill-prob-widen-mult", type=float, default=DYNAMIC_QUOTE_FILL_PROB_WIDEN_MULT)
+    parser.add_argument("--dynamic-quote-fill-prob-baseline", type=float, default=DYNAMIC_QUOTE_FILL_PROB_BASELINE)
+    parser.add_argument("--dynamic-quote-max-widen-bps", type=float, default=DYNAMIC_QUOTE_MAX_WIDEN_BPS)
     parser.add_argument("--max-position-contracts", type=float, default=MAX_POSITION_CONTRACTS)
     parser.add_argument("--soft-position-contracts", type=float, default=SOFT_POSITION_CONTRACTS)
     parser.add_argument("--order-ttl-ms", type=float, default=ORDER_TTL_NS / 1_000_000.0)
@@ -1223,6 +1948,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-edge-threshold-bps", type=float, default=0.02)
     parser.add_argument("--edge-if-filled-threshold-bps", type=float, default=-999.0)
     parser.add_argument("--fill-prob-threshold", type=float, default=0.02)
+    parser.add_argument("--placement-expected-margin-bps", type=float, default=MIN_PLACEMENT_EXPECTED_MARGIN_BPS)
+    parser.add_argument(
+        "--placement-edge-if-filled-margin-bps",
+        type=float,
+        default=MIN_PLACEMENT_EDGE_IF_FILLED_MARGIN_BPS,
+    )
     parser.add_argument("--intraday-percentile-gate", action="store_true")
     parser.add_argument("--expected-edge-percentile", type=float, default=0.0)
     parser.add_argument("--edge-if-filled-percentile", type=float, default=0.0)
@@ -1243,8 +1974,12 @@ def parse_args() -> argparse.Namespace:
 def apply_args(args: argparse.Namespace) -> None:
     global RESULT_TAG, EXCHANGE_MODEL, ORDER_QTY, MAKER_FEE_RATE, TAKER_FEE_RATE
     global BASE_HALF_SPREAD_BPS, MAX_POSITION_CONTRACTS, SOFT_POSITION_CONTRACTS
+    global USE_DYNAMIC_QUOTE, DYNAMIC_QUOTE_EXPECTED_EDGE_MULT, DYNAMIC_QUOTE_EDGE_IF_FILLED_MULT
+    global DYNAMIC_QUOTE_MAX_TIGHTEN_BPS, DYNAMIC_QUOTE_FILL_PROB_WIDEN_MULT
+    global DYNAMIC_QUOTE_FILL_PROB_BASELINE, DYNAMIC_QUOTE_MAX_WIDEN_BPS
     global ORDER_TTL_NS, REST_MIN_INTERVAL_NS
     global MIN_EXPECTED_EDGE_BPS, MIN_EDGE_IF_FILLED_BPS, MIN_FILL_PROB
+    global MIN_PLACEMENT_EXPECTED_MARGIN_BPS, MIN_PLACEMENT_EDGE_IF_FILLED_MARGIN_BPS
     global USE_INTRADAY_PERCENTILE_GATE, EXPECTED_EDGE_PERCENTILE, EDGE_IF_FILLED_PERCENTILE, FILL_PROB_PERCENTILE
     global REDUCE_ONLY_AFTER_SOFT_POSITION, DAILY_LOSS_LIMIT_USDT, DAILY_FILL_LIMIT
     global USE_REGIME_EXPECTED_EDGE_GATE, REGIME_EXPECTED_EDGE_WARMUP_SAMPLES, REGIME_EXPECTED_EDGE_EWM_ALPHA
@@ -1257,6 +1992,13 @@ def apply_args(args: argparse.Namespace) -> None:
     MAKER_FEE_RATE = args.maker_fee_rate
     TAKER_FEE_RATE = args.taker_fee_rate
     BASE_HALF_SPREAD_BPS = args.base_half_spread_bps
+    USE_DYNAMIC_QUOTE = args.dynamic_quote
+    DYNAMIC_QUOTE_EXPECTED_EDGE_MULT = args.dynamic_quote_expected_edge_mult
+    DYNAMIC_QUOTE_EDGE_IF_FILLED_MULT = args.dynamic_quote_edge_if_filled_mult
+    DYNAMIC_QUOTE_MAX_TIGHTEN_BPS = args.dynamic_quote_max_tighten_bps
+    DYNAMIC_QUOTE_FILL_PROB_WIDEN_MULT = args.dynamic_quote_fill_prob_widen_mult
+    DYNAMIC_QUOTE_FILL_PROB_BASELINE = args.dynamic_quote_fill_prob_baseline
+    DYNAMIC_QUOTE_MAX_WIDEN_BPS = args.dynamic_quote_max_widen_bps
     MAX_POSITION_CONTRACTS = args.max_position_contracts
     SOFT_POSITION_CONTRACTS = args.soft_position_contracts
     ORDER_TTL_NS = int(args.order_ttl_ms * 1_000_000)
@@ -1264,6 +2006,8 @@ def apply_args(args: argparse.Namespace) -> None:
     MIN_EXPECTED_EDGE_BPS = args.expected_edge_threshold_bps
     MIN_EDGE_IF_FILLED_BPS = args.edge_if_filled_threshold_bps
     MIN_FILL_PROB = args.fill_prob_threshold
+    MIN_PLACEMENT_EXPECTED_MARGIN_BPS = args.placement_expected_margin_bps
+    MIN_PLACEMENT_EDGE_IF_FILLED_MARGIN_BPS = args.placement_edge_if_filled_margin_bps
     USE_INTRADAY_PERCENTILE_GATE = args.intraday_percentile_gate
     EXPECTED_EDGE_PERCENTILE = args.expected_edge_percentile
     EDGE_IF_FILLED_PERCENTILE = args.edge_if_filled_percentile
@@ -1292,6 +2036,7 @@ def main() -> None:
         f"expected_edge>={MIN_EXPECTED_EDGE_BPS}bps "
         f"edge_if_filled>={MIN_EDGE_IF_FILLED_BPS}bps "
         f"fill_prob>={MIN_FILL_PROB} "
+        f"placement_margin>=({MIN_PLACEMENT_EXPECTED_MARGIN_BPS},{MIN_PLACEMENT_EDGE_IF_FILLED_MARGIN_BPS})bps "
         f"intraday_percentile={USE_INTRADAY_PERCENTILE_GATE} "
         f"pcts=({EXPECTED_EDGE_PERCENTILE},{EDGE_IF_FILLED_PERCENTILE},{FILL_PROB_PERCENTILE}) "
         f"reduce_only_after_soft={REDUCE_ONLY_AFTER_SOFT_POSITION} "
@@ -1299,7 +2044,11 @@ def main() -> None:
         f"daily_fill_limit={DAILY_FILL_LIMIT} "
         f"regime_gate={USE_REGIME_EXPECTED_EDGE_GATE} "
         f"regime_min=({REGIME_MIN_BID_EXPECTED_EDGE_BPS},{REGIME_MIN_ASK_EXPECTED_EDGE_BPS}) "
-        f"regime_alpha={REGIME_EXPECTED_EDGE_EWM_ALPHA}"
+        f"regime_alpha={REGIME_EXPECTED_EDGE_EWM_ALPHA} "
+        f"dynamic_quote={USE_DYNAMIC_QUOTE} "
+        f"dynamic_mult=({DYNAMIC_QUOTE_EXPECTED_EDGE_MULT},{DYNAMIC_QUOTE_EDGE_IF_FILLED_MULT}) "
+        f"dynamic_max_tighten={DYNAMIC_QUOTE_MAX_TIGHTEN_BPS} "
+        f"dynamic_fill_widen=({DYNAMIC_QUOTE_FILL_PROB_WIDEN_MULT},{DYNAMIC_QUOTE_FILL_PROB_BASELINE})"
     )
 
     key = None if args.skip_download else tardis_key()

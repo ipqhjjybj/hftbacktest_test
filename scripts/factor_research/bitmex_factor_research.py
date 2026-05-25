@@ -40,7 +40,7 @@ from factor_research.buckets import (
     maker_fill_edge_bucket_rows,
     write_csv,
 )
-from factor_research.factors import FACTOR_NAMES, build_factor_frame
+from factor_research.factors import BASE_COLUMNS, FACTOR_NAMES, build_factor_frame
 from factor_research.labels import build_labels
 from factor_research.maker_fill_labels import build_maker_fill_labels
 from factor_research.plots import write_charts, write_fill_charts, write_lifecycle_fill_charts
@@ -50,7 +50,7 @@ from factor_research.report import render_report
 RESULT_DIR = REPO_ROOT / "results" / "factor_research"
 DEFAULT_DATES = ("20260516", "20260517", "20260518")
 DEFAULT_HORIZONS_MS = (100, 250, 500, 1000)
-BASE_COLUMNS = 9
+BASE_COLUMN_COUNT = len(BASE_COLUMNS)
 
 
 @njit
@@ -89,6 +89,16 @@ def collect_samples(hbt, sample_interval_ns, end_ts_ns, rows):
         rows[count, 6] = sell_qty
         rows[count, 7] = buy_count
         rows[count, 8] = sell_count
+        bid_tick = depth.best_bid_tick
+        ask_tick = depth.best_ask_tick
+        rows[count, 9] = depth.bid_qty_at_tick(bid_tick - 1)
+        rows[count, 10] = depth.ask_qty_at_tick(ask_tick + 1)
+        rows[count, 11] = depth.bid_qty_at_tick(bid_tick - 2)
+        rows[count, 12] = depth.ask_qty_at_tick(ask_tick + 2)
+        rows[count, 13] = depth.bid_qty_at_tick(bid_tick - 3)
+        rows[count, 14] = depth.ask_qty_at_tick(ask_tick + 3)
+        rows[count, 15] = depth.bid_qty_at_tick(bid_tick - 4)
+        rows[count, 16] = depth.ask_qty_at_tick(ask_tick + 4)
         count += 1
     return count
 
@@ -128,7 +138,7 @@ def run_one_day(symbol: str, yyyymmdd: str, sample_interval_ms: int, max_samples
     sample_interval_ns = sample_interval_ms * 1_000_000
     estimated = int((24 * 60 * 60 * 1_000) / sample_interval_ms) + 10_000
     capacity = max_samples if max_samples > 0 else estimated
-    rows = np.zeros((capacity, BASE_COLUMNS), dtype=np.float64)
+    rows = np.zeros((capacity, BASE_COLUMN_COUNT), dtype=np.float64)
     hbt = HashMapMarketDepthBacktest([build_asset(npz_path, symbol)])
     count = collect_samples(hbt, sample_interval_ns, end_close_ts_ns(yyyymmdd), rows)
     return rows[:count].copy()
