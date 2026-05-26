@@ -62,6 +62,19 @@ DYNAMIC_QUOTE_MAX_TIGHTEN_BPS = 2.0
 DYNAMIC_QUOTE_FILL_PROB_WIDEN_MULT = 0.0
 DYNAMIC_QUOTE_FILL_PROB_BASELINE = 0.20
 DYNAMIC_QUOTE_MAX_WIDEN_BPS = 2.0
+USE_SCORE_AWARE_QUOTE_DISTANCE = False
+QUOTE_EDGE_IF_FILLED_WIDEN_TARGET_BPS = 1.0
+QUOTE_EDGE_IF_FILLED_WIDEN_MULT = 0.5
+QUOTE_REGIME_WIDEN_THRESHOLD_BPS = 0.04
+QUOTE_REGIME_WIDEN_MULT = 20.0
+QUOTE_MAX_SCORE_WIDEN_BPS = 2.0
+USE_STALE_QUOTE_CONTROL = False
+STALE_QUOTE_TTL_NS = 500_000_000
+STALE_QUOTE_MIN_EDGE_IF_FILLED_MARGIN_BPS = 1.0
+STALE_QUOTE_MIN_REGIME_BPS = 0.04
+POSITION_AGE_REDUCE_ONLY_NS = 0
+POSITION_AGE_REDUCE_TIGHTEN_BPS = 0.0
+POSITION_AGE_MARKET_EXIT_NS = 0
 
 MAKER_FEE_RATE = 0.0
 TAKER_FEE_RATE = 0.0001
@@ -728,7 +741,43 @@ def is_reduce_side(side, pos):
 
 
 @njit
-def should_quote(side, pos, scores, thresholds, risk_halt_new_entries, regime_halt_new_entries):
+def side_regime_ewm(side, metrics):
+    if side > 0:
+        return metrics[57]
+    return metrics[58]
+
+
+@njit
+def side_score_values(side, scores, thresholds):
+    if side > 0:
+        return scores[0], scores[2], scores[4], thresholds[0], thresholds[2], thresholds[4]
+    return scores[1], scores[3], scores[5], thresholds[1], thresholds[3], thresholds[5]
+
+
+@njit
+def placement_is_stale_sensitive(side, placement_record):
+    if placement_record[0] <= 0.0:
+        return False
+    if side > 0:
+        regime = placement_record[21]
+    else:
+        regime = placement_record[22]
+    return (
+        placement_record[19] < STALE_QUOTE_MIN_EDGE_IF_FILLED_MARGIN_BPS
+        or regime < STALE_QUOTE_MIN_REGIME_BPS
+    )
+
+
+@njit
+def should_quote(
+    side,
+    pos,
+    scores,
+    thresholds,
+    risk_halt_new_entries,
+    regime_halt_new_entries,
+    aged_position_reduce_only,
+):
     if ORDER_QTY < BITMEX_LOT_SIZE:
         return False, 1
     if side > 0 and pos + ORDER_QTY > MAX_POSITION_CONTRACTS:
@@ -740,23 +789,13 @@ def should_quote(side, pos, scores, thresholds, risk_halt_new_entries, regime_ha
         return False, 4
     if regime_halt_new_entries and not reduce_side:
         return False, 6
+    if aged_position_reduce_only and not reduce_side:
+        return False, 7
     if REDUCE_ONLY_AFTER_SOFT_POSITION and abs(pos) >= SOFT_POSITION_CONTRACTS and not reduce_side:
         return False, 5
-    if side > 0:
-        expected = scores[0]
-        edge_if_filled = scores[2]
-        fill_prob = scores[4]
-    else:
-        expected = scores[1]
-        edge_if_filled = scores[3]
-        fill_prob = scores[5]
-        expected_threshold = thresholds[1]
-        edge_if_filled_threshold = thresholds[3]
-        fill_prob_threshold = thresholds[5]
-    if side > 0:
-        expected_threshold = thresholds[0]
-        edge_if_filled_threshold = thresholds[2]
-        fill_prob_threshold = thresholds[4]
+    expected, edge_if_filled, fill_prob, expected_threshold, edge_if_filled_threshold, fill_prob_threshold = (
+        side_score_values(side, scores, thresholds)
+    )
     matched = (
         expected >= expected_threshold + MIN_PLACEMENT_EXPECTED_MARGIN_BPS
         and edge_if_filled >= edge_if_filled_threshold + MIN_PLACEMENT_EDGE_IF_FILLED_MARGIN_BPS
@@ -768,7 +807,7 @@ def should_quote(side, pos, scores, thresholds, risk_halt_new_entries, regime_ha
 
 
 @njit
-def quote_half_spread_bps(side, depth, pos, scores, thresholds):
+def quote_half_spread_bps(side, depth, pos, scores, thresholds, metrics, position_age_ns):
     mid = (depth.best_bid + depth.best_ask) / 2.0
     inv = inventory_ratio(pos)
     min_half_spread_bps = MIN_HALF_SPREAD_TICKS * BITMEX_TICK_SIZE / mid * 10_000.0
@@ -776,18 +815,9 @@ def quote_half_spread_bps(side, depth, pos, scores, thresholds):
     half_spread = BASE_HALF_SPREAD_BPS + VOL_SPREAD_MULTIPLIER * vol_bps + abs(inv) * INVENTORY_SPREAD_BPS_AT_SOFT_LIMIT
 
     if USE_DYNAMIC_QUOTE and not is_reduce_side(side, pos):
-        if side > 0:
-            expected = scores[0]
-            edge_if_filled = scores[2]
-            fill_prob = scores[4]
-            expected_threshold = thresholds[0]
-            edge_if_filled_threshold = thresholds[2]
-        else:
-            expected = scores[1]
-            edge_if_filled = scores[3]
-            fill_prob = scores[5]
-            expected_threshold = thresholds[1]
-            edge_if_filled_threshold = thresholds[3]
+        expected, edge_if_filled, fill_prob, expected_threshold, edge_if_filled_threshold, _ = side_score_values(
+            side, scores, thresholds
+        )
 
         expected_margin = max(0.0, expected - expected_threshold)
         edge_if_filled_margin = max(0.0, edge_if_filled - edge_if_filled_threshold)
@@ -805,14 +835,31 @@ def quote_half_spread_bps(side, depth, pos, scores, thresholds):
 
         half_spread = half_spread - tighten + widen
 
+    if USE_SCORE_AWARE_QUOTE_DISTANCE and not is_reduce_side(side, pos):
+        _, edge_if_filled, _, _, edge_if_filled_threshold, _ = side_score_values(side, scores, thresholds)
+        edge_if_filled_margin = edge_if_filled - edge_if_filled_threshold
+        score_widen = max(0.0, QUOTE_EDGE_IF_FILLED_WIDEN_TARGET_BPS - edge_if_filled_margin)
+        score_widen *= QUOTE_EDGE_IF_FILLED_WIDEN_MULT
+
+        regime = side_regime_ewm(side, metrics)
+        regime_widen = max(0.0, QUOTE_REGIME_WIDEN_THRESHOLD_BPS - regime) * QUOTE_REGIME_WIDEN_MULT
+        widen = score_widen + regime_widen
+        if widen > QUOTE_MAX_SCORE_WIDEN_BPS:
+            widen = QUOTE_MAX_SCORE_WIDEN_BPS
+        half_spread += widen
+
+    if POSITION_AGE_REDUCE_TIGHTEN_BPS > 0.0 and is_reduce_side(side, pos):
+        if POSITION_AGE_REDUCE_ONLY_NS > 0 and position_age_ns >= POSITION_AGE_REDUCE_ONLY_NS:
+            half_spread -= POSITION_AGE_REDUCE_TIGHTEN_BPS
+
     return max(half_spread, min_half_spread_bps)
 
 
 @njit
-def target_price(side, depth, pos, scores, thresholds):
+def target_price(side, depth, pos, scores, thresholds, metrics, position_age_ns):
     mid = (depth.best_bid + depth.best_ask) / 2.0
     inv = inventory_ratio(pos)
-    half_spread = quote_half_spread_bps(side, depth, pos, scores, thresholds)
+    half_spread = quote_half_spread_bps(side, depth, pos, scores, thresholds, metrics, position_age_ns)
     anchor = mid * (1.0 - inv * INVENTORY_SKEW_BPS_AT_SOFT_LIMIT / 10_000.0)
     if side > 0:
         raw = anchor * (1.0 - half_spread / 10_000.0)
@@ -899,6 +946,27 @@ def manage_side(
             hbt.cancel(0, order_id, False)
             clear_placement_record(placement_record)
             metrics[filter_cancel_metric] += 1
+            return hbt.current_timestamp + ORDER_INFLIGHT_NS, hbt.current_timestamp + REST_MIN_INTERVAL_NS, 0
+        return inflight_until, next_rest_allowed_ts, live_since
+
+    if (
+        USE_STALE_QUOTE_CONTROL
+        and STALE_QUOTE_TTL_NS > 0
+        and existing is not None
+        and live_since > 0
+        and hbt.current_timestamp - live_since >= STALE_QUOTE_TTL_NS
+        and placement_is_stale_sensitive(side, placement_record)
+    ):
+        if existing.cancellable:
+            if hbt.current_timestamp < next_rest_allowed_ts:
+                metrics[rest_skip_metric] += 1
+                return inflight_until, next_rest_allowed_ts, live_since
+            hbt.cancel(0, order_id, False)
+            clear_placement_record(placement_record)
+            if side > 0:
+                metrics[69] += 1
+            else:
+                metrics[70] += 1
             return hbt.current_timestamp + ORDER_INFLIGHT_NS, hbt.current_timestamp + REST_MIN_INTERVAL_NS, 0
         return inflight_until, next_rest_allowed_ts, live_since
 
@@ -1119,6 +1187,8 @@ def run_strategy(
     bid_placement_record = np.zeros(PLACEMENT_RECORD_LEN, dtype=np.float64)
     ask_placement_record = np.zeros(PLACEMENT_RECORD_LEN, dtype=np.float64)
     last_percentile_update_ts = 0
+    position_open_ts = 0
+    position_exit_inflight_until = 0
 
     while hbt.elapse(ORDER_UPDATE_INTERVAL_NS) == 0:
         if hbt.current_timestamp >= end_close_ts:
@@ -1153,6 +1223,14 @@ def run_strategy(
             clear_placement_record(ask_placement_record)
         else:
             pos = hbt.position(0)
+            if abs(pos) <= 0:
+                position_open_ts = 0
+            elif position_open_ts == 0:
+                position_open_ts = hbt.current_timestamp
+            position_age_ns = 0
+            if position_open_ts > 0:
+                position_age_ns = hbt.current_timestamp - position_open_ts
+
             scores = predict_scores(
                 depth,
                 signal_ts,
@@ -1211,14 +1289,48 @@ def run_strategy(
             update_risk_metrics(hbt, metrics)
             risk_halt = risk_halt_new_entries(metrics)
             bid_regime_halt, ask_regime_halt = update_regime_expected_edge_gate(scores, metrics)
-            bid_ok, bid_reason = should_quote(1, pos, scores, score_thresholds, risk_halt, bid_regime_halt)
-            ask_ok, ask_reason = should_quote(-1, pos, scores, score_thresholds, risk_halt, ask_regime_halt)
+            aged_position_reduce_only = (
+                POSITION_AGE_REDUCE_ONLY_NS > 0
+                and abs(pos) > 0
+                and position_age_ns >= POSITION_AGE_REDUCE_ONLY_NS
+            )
+            position_market_exit_submitted = False
+
+            if (
+                POSITION_AGE_MARKET_EXIT_NS > 0
+                and abs(pos) > 0
+                and position_age_ns >= POSITION_AGE_MARKET_EXIT_NS
+                and hbt.current_timestamp >= position_exit_inflight_until
+            ):
+                cancel_all_orders(hbt)
+                clear_placement_record(bid_placement_record)
+                clear_placement_record(ask_placement_record)
+                if pos > 0:
+                    hbt.submit_sell_order(0, 91_101, depth.best_bid, abs(pos), IOC, MARKET, True)
+                else:
+                    hbt.submit_buy_order(0, 91_102, depth.best_ask, abs(pos), IOC, MARKET, True)
+                metrics[73] += 1
+                position_exit_inflight_until = hbt.current_timestamp + ORDER_INFLIGHT_NS
+                aged_position_reduce_only = True
+                position_market_exit_submitted = True
+
+            bid_ok, bid_reason = should_quote(
+                1, pos, scores, score_thresholds, risk_halt, bid_regime_halt, aged_position_reduce_only
+            )
+            ask_ok, ask_reason = should_quote(
+                -1, pos, scores, score_thresholds, risk_halt, ask_regime_halt, aged_position_reduce_only
+            )
+            if position_market_exit_submitted:
+                bid_ok = False
+                ask_ok = False
             if bid_reason == 3:
                 metrics[20] += 1
             elif bid_reason == 4:
                 metrics[51] += 1
             elif bid_reason == 5:
                 metrics[53] += 1
+            elif bid_reason == 7:
+                metrics[71] += 1
             elif bid_ok:
                 metrics[38] += 1
             if ask_reason == 3:
@@ -1227,17 +1339,19 @@ def run_strategy(
                 metrics[52] += 1
             elif ask_reason == 5:
                 metrics[54] += 1
+            elif ask_reason == 7:
+                metrics[72] += 1
             elif ask_ok:
                 metrics[39] += 1
 
-            bid_half_spread = quote_half_spread_bps(1, depth, pos, scores, score_thresholds)
-            ask_half_spread = quote_half_spread_bps(-1, depth, pos, scores, score_thresholds)
+            bid_half_spread = quote_half_spread_bps(1, depth, pos, scores, score_thresholds, metrics, position_age_ns)
+            ask_half_spread = quote_half_spread_bps(-1, depth, pos, scores, score_thresholds, metrics, position_age_ns)
             metrics[65] += bid_half_spread
             metrics[66] += ask_half_spread
             metrics[67] += 1
             metrics[68] += 1
 
-            bid_px = target_price(1, depth, pos, scores, score_thresholds)
+            bid_px = target_price(1, depth, pos, scores, score_thresholds, metrics, position_age_ns)
             bid_inflight_until, next_rest_allowed_ts, bid_live_since = manage_side(
                 hbt,
                 1,
@@ -1253,7 +1367,7 @@ def run_strategy(
                 bid_placement_record,
                 metrics,
             )
-            ask_px = target_price(-1, depth, pos, scores, score_thresholds)
+            ask_px = target_price(-1, depth, pos, scores, score_thresholds, metrics, position_age_ns)
             ask_inflight_until, next_rest_allowed_ts, ask_live_since = manage_side(
                 hbt,
                 -1,
@@ -1582,7 +1696,7 @@ def run_backtest(bitmex_npz: Path, yyyymmdd: str, model_path: Path) -> Path:
     model_mean, model_std, model_coef, include_interactions, clip_z, model = load_edge_model(model_path)
     hbt = HashMapMarketDepthBacktest([build_asset(bitmex_npz)])
     recorder = Recorder(1, 100_000)
-    metrics = np.zeros(72, dtype=np.float64)
+    metrics = np.zeros(80, dtype=np.float64)
     fill_records = np.zeros((20_000, len(FILL_ATTRIBUTION_FIELDS) - 2), dtype=np.float64)
     ok = run_strategy(
         hbt,
@@ -1647,6 +1761,19 @@ def write_summary(result_npz: Path, yyyymmdd: str, model_path: Path, model: dict
         "dynamic_quote_fill_prob_widen_mult": DYNAMIC_QUOTE_FILL_PROB_WIDEN_MULT,
         "dynamic_quote_fill_prob_baseline": DYNAMIC_QUOTE_FILL_PROB_BASELINE,
         "dynamic_quote_max_widen_bps": DYNAMIC_QUOTE_MAX_WIDEN_BPS,
+        "score_aware_quote_distance": USE_SCORE_AWARE_QUOTE_DISTANCE,
+        "quote_edge_if_filled_widen_target_bps": QUOTE_EDGE_IF_FILLED_WIDEN_TARGET_BPS,
+        "quote_edge_if_filled_widen_mult": QUOTE_EDGE_IF_FILLED_WIDEN_MULT,
+        "quote_regime_widen_threshold_bps": QUOTE_REGIME_WIDEN_THRESHOLD_BPS,
+        "quote_regime_widen_mult": QUOTE_REGIME_WIDEN_MULT,
+        "quote_max_score_widen_bps": QUOTE_MAX_SCORE_WIDEN_BPS,
+        "stale_quote_control": USE_STALE_QUOTE_CONTROL,
+        "stale_quote_ttl_ms": STALE_QUOTE_TTL_NS / 1_000_000.0,
+        "stale_quote_min_edge_if_filled_margin_bps": STALE_QUOTE_MIN_EDGE_IF_FILLED_MARGIN_BPS,
+        "stale_quote_min_regime_bps": STALE_QUOTE_MIN_REGIME_BPS,
+        "position_age_reduce_only_ms": POSITION_AGE_REDUCE_ONLY_NS / 1_000_000.0,
+        "position_age_reduce_tighten_bps": POSITION_AGE_REDUCE_TIGHTEN_BPS,
+        "position_age_market_exit_ms": POSITION_AGE_MARKET_EXIT_NS / 1_000_000.0,
         "order_ttl_ms": ORDER_TTL_NS / 1_000_000.0,
         "rest_min_interval_ms": REST_MIN_INTERVAL_NS / 1_000_000.0,
         "model_path": str(model_path),
@@ -1688,6 +1815,11 @@ def write_summary(result_npz: Path, yyyymmdd: str, model_path: Path, model: dict
         "risk_halt_gate_ask": int(metrics[52]),
         "soft_position_gate_bid": int(metrics[53]),
         "soft_position_gate_ask": int(metrics[54]),
+        "stale_quote_cancel_bid": int(metrics[69]),
+        "stale_quote_cancel_ask": int(metrics[70]),
+        "position_age_gate_bid": int(metrics[71]),
+        "position_age_gate_ask": int(metrics[72]),
+        "position_age_market_exit": int(metrics[73]),
         "regime_gate_bid": int(metrics[55]),
         "regime_gate_ask": int(metrics[56]),
         "final_regime_bid_expected_edge_ewm_bps": float(metrics[57]),
@@ -1873,6 +2005,19 @@ def write_aggregate(summaries: list[dict]) -> Path:
         "dynamic_quote_fill_prob_widen_mult",
         "dynamic_quote_fill_prob_baseline",
         "dynamic_quote_max_widen_bps",
+        "score_aware_quote_distance",
+        "quote_edge_if_filled_widen_target_bps",
+        "quote_edge_if_filled_widen_mult",
+        "quote_regime_widen_threshold_bps",
+        "quote_regime_widen_mult",
+        "quote_max_score_widen_bps",
+        "stale_quote_control",
+        "stale_quote_ttl_ms",
+        "stale_quote_min_edge_if_filled_margin_bps",
+        "stale_quote_min_regime_bps",
+        "position_age_reduce_only_ms",
+        "position_age_reduce_tighten_bps",
+        "position_age_market_exit_ms",
         "min_placement_expected_margin_bps",
         "min_placement_edge_if_filled_margin_bps",
         "daily_loss_limit_usdt",
@@ -1888,6 +2033,11 @@ def write_aggregate(summaries: list[dict]) -> Path:
         "regime_gate_ask",
         "soft_position_gate_bid",
         "soft_position_gate_ask",
+        "stale_quote_cancel_bid",
+        "stale_quote_cancel_ask",
+        "position_age_gate_bid",
+        "position_age_gate_ask",
+        "position_age_market_exit",
         "score_pass_bid",
         "score_pass_ask",
         "avg_gate_bid_expected_edge_bps",
@@ -1938,6 +2088,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dynamic-quote-fill-prob-widen-mult", type=float, default=DYNAMIC_QUOTE_FILL_PROB_WIDEN_MULT)
     parser.add_argument("--dynamic-quote-fill-prob-baseline", type=float, default=DYNAMIC_QUOTE_FILL_PROB_BASELINE)
     parser.add_argument("--dynamic-quote-max-widen-bps", type=float, default=DYNAMIC_QUOTE_MAX_WIDEN_BPS)
+    parser.add_argument("--score-aware-quote-distance", action="store_true")
+    parser.add_argument(
+        "--quote-edge-if-filled-widen-target-bps",
+        type=float,
+        default=QUOTE_EDGE_IF_FILLED_WIDEN_TARGET_BPS,
+    )
+    parser.add_argument("--quote-edge-if-filled-widen-mult", type=float, default=QUOTE_EDGE_IF_FILLED_WIDEN_MULT)
+    parser.add_argument("--quote-regime-widen-threshold-bps", type=float, default=QUOTE_REGIME_WIDEN_THRESHOLD_BPS)
+    parser.add_argument("--quote-regime-widen-mult", type=float, default=QUOTE_REGIME_WIDEN_MULT)
+    parser.add_argument("--quote-max-score-widen-bps", type=float, default=QUOTE_MAX_SCORE_WIDEN_BPS)
+    parser.add_argument("--stale-quote-control", action="store_true")
+    parser.add_argument("--stale-quote-ttl-ms", type=float, default=STALE_QUOTE_TTL_NS / 1_000_000.0)
+    parser.add_argument(
+        "--stale-quote-min-edge-if-filled-margin-bps",
+        type=float,
+        default=STALE_QUOTE_MIN_EDGE_IF_FILLED_MARGIN_BPS,
+    )
+    parser.add_argument("--stale-quote-min-regime-bps", type=float, default=STALE_QUOTE_MIN_REGIME_BPS)
+    parser.add_argument("--position-age-reduce-only-ms", type=float, default=POSITION_AGE_REDUCE_ONLY_NS / 1_000_000.0)
+    parser.add_argument("--position-age-reduce-tighten-bps", type=float, default=POSITION_AGE_REDUCE_TIGHTEN_BPS)
+    parser.add_argument("--position-age-market-exit-ms", type=float, default=POSITION_AGE_MARKET_EXIT_NS / 1_000_000.0)
     parser.add_argument("--max-position-contracts", type=float, default=MAX_POSITION_CONTRACTS)
     parser.add_argument("--soft-position-contracts", type=float, default=SOFT_POSITION_CONTRACTS)
     parser.add_argument("--order-ttl-ms", type=float, default=ORDER_TTL_NS / 1_000_000.0)
@@ -1977,6 +2148,12 @@ def apply_args(args: argparse.Namespace) -> None:
     global USE_DYNAMIC_QUOTE, DYNAMIC_QUOTE_EXPECTED_EDGE_MULT, DYNAMIC_QUOTE_EDGE_IF_FILLED_MULT
     global DYNAMIC_QUOTE_MAX_TIGHTEN_BPS, DYNAMIC_QUOTE_FILL_PROB_WIDEN_MULT
     global DYNAMIC_QUOTE_FILL_PROB_BASELINE, DYNAMIC_QUOTE_MAX_WIDEN_BPS
+    global USE_SCORE_AWARE_QUOTE_DISTANCE, QUOTE_EDGE_IF_FILLED_WIDEN_TARGET_BPS
+    global QUOTE_EDGE_IF_FILLED_WIDEN_MULT, QUOTE_REGIME_WIDEN_THRESHOLD_BPS
+    global QUOTE_REGIME_WIDEN_MULT, QUOTE_MAX_SCORE_WIDEN_BPS
+    global USE_STALE_QUOTE_CONTROL, STALE_QUOTE_TTL_NS
+    global STALE_QUOTE_MIN_EDGE_IF_FILLED_MARGIN_BPS, STALE_QUOTE_MIN_REGIME_BPS
+    global POSITION_AGE_REDUCE_ONLY_NS, POSITION_AGE_REDUCE_TIGHTEN_BPS, POSITION_AGE_MARKET_EXIT_NS
     global ORDER_TTL_NS, REST_MIN_INTERVAL_NS
     global MIN_EXPECTED_EDGE_BPS, MIN_EDGE_IF_FILLED_BPS, MIN_FILL_PROB
     global MIN_PLACEMENT_EXPECTED_MARGIN_BPS, MIN_PLACEMENT_EDGE_IF_FILLED_MARGIN_BPS
@@ -1999,6 +2176,19 @@ def apply_args(args: argparse.Namespace) -> None:
     DYNAMIC_QUOTE_FILL_PROB_WIDEN_MULT = args.dynamic_quote_fill_prob_widen_mult
     DYNAMIC_QUOTE_FILL_PROB_BASELINE = args.dynamic_quote_fill_prob_baseline
     DYNAMIC_QUOTE_MAX_WIDEN_BPS = args.dynamic_quote_max_widen_bps
+    USE_SCORE_AWARE_QUOTE_DISTANCE = args.score_aware_quote_distance
+    QUOTE_EDGE_IF_FILLED_WIDEN_TARGET_BPS = args.quote_edge_if_filled_widen_target_bps
+    QUOTE_EDGE_IF_FILLED_WIDEN_MULT = args.quote_edge_if_filled_widen_mult
+    QUOTE_REGIME_WIDEN_THRESHOLD_BPS = args.quote_regime_widen_threshold_bps
+    QUOTE_REGIME_WIDEN_MULT = args.quote_regime_widen_mult
+    QUOTE_MAX_SCORE_WIDEN_BPS = args.quote_max_score_widen_bps
+    USE_STALE_QUOTE_CONTROL = args.stale_quote_control
+    STALE_QUOTE_TTL_NS = int(args.stale_quote_ttl_ms * 1_000_000)
+    STALE_QUOTE_MIN_EDGE_IF_FILLED_MARGIN_BPS = args.stale_quote_min_edge_if_filled_margin_bps
+    STALE_QUOTE_MIN_REGIME_BPS = args.stale_quote_min_regime_bps
+    POSITION_AGE_REDUCE_ONLY_NS = int(args.position_age_reduce_only_ms * 1_000_000)
+    POSITION_AGE_REDUCE_TIGHTEN_BPS = args.position_age_reduce_tighten_bps
+    POSITION_AGE_MARKET_EXIT_NS = int(args.position_age_market_exit_ms * 1_000_000)
     MAX_POSITION_CONTRACTS = args.max_position_contracts
     SOFT_POSITION_CONTRACTS = args.soft_position_contracts
     ORDER_TTL_NS = int(args.order_ttl_ms * 1_000_000)
