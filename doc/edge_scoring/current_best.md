@@ -1,6 +1,6 @@
 # Current Best Edge-Scored Maker Candidates
 
-更新时间: 2026-05-25
+更新时间: 2026-05-26
 
 ## Current Monthly Best
 
@@ -51,6 +51,28 @@ worst day 20260421 -0.065500
 max position max 100
 ```
 
+Additional previous-period validation:
+
+```text
+period: 20260317-20260417
+model: 22 factors, no interactions
+model tag: edge_score_wf_train14_20260317_20260417_h250_new_hf_nointer
+strategy result:
+  results/bitmex_xbtusdt_edge_scored_maker_edge_scored_new22_e95_i97_m001_a00005_20260317_20260417.aggregate.csv
+
+total PnL +2.175163
+gross PnL +2.175850
+maker rebate -0.000687
+fills 8025
+PnL/fill +0.00027105
+positive days 27/32
+active-day positive days 27/32
+3 月 +1.285163
+4 月 +0.890000
+worst day 20260324 -0.048450
+best day 20260323 +0.302750
+```
+
 ## Previous Benchmarks
 
 Old 9-factor static regime/risk best:
@@ -97,6 +119,8 @@ Reason:
 Remaining issue:
   Calendar-day win rate is slightly lower than old 9f static best.
   Bad days remain: 20260421, 20260512, 20260420.
+  Previous-period validation is strong, but does not remove the need
+  to understand the remaining bad-day mechanics before quote-distance changes.
 ```
 
 ## Next Work

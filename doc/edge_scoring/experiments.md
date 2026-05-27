@@ -1,6 +1,6 @@
 # Edge Scoring Experiment Log
 
-更新时间: 2026-05-25
+更新时间: 2026-05-26
 
 This file keeps compact experiment summaries. The full historical progress text is archived at:
 
@@ -870,4 +870,82 @@ Make it side/day/regime-aware instead of global:
   2. Use entry-side attribution, not fill-side attribution, when deciding which side to widen.
   3. Keep the good-day giveback constraint explicit; a bad-day improvement is not enough
      if it gives back more on 20260514/20260515/20260517.
+```
+
+## 2026-05-26 New22 Previous-Period Validation
+
+Purpose:
+
+```text
+Check whether the current new22 main candidate generalizes to the previous
+20260317-20260417 period with the same e95/i97/regime_min=0.01/hard-risk params.
+```
+
+Data:
+
+```text
+Backfilled BitMEX XBTUSDT data from 20260301 to 20260417.
+The 14-day walk-forward for test period 20260317-20260417 uses training data
+starting at 20260303.
+```
+
+Setup:
+
+```text
+period: 20260317-20260417
+model: 22 factors, no interactions
+model tag: edge_score_wf_train14_20260317_20260417_h250_new_hf_nointer
+strategy: expected pct95, edge_if_filled pct97, regime_min 0.01, alpha 0.00005
+result:
+  results/bitmex_xbtusdt_edge_scored_maker_edge_scored_new22_e95_i97_m001_a00005_20260317_20260417.aggregate.csv
+```
+
+Research-layer walk-forward:
+
+```text
+bid avg top-bottom actual edge +0.118239 bps
+ask avg top-bottom actual edge +0.115351 bps
+bid avg top-bottom fill prob +0.017788
+ask avg top-bottom fill prob +0.021413
+```
+
+Strategy result:
+
+```text
+total PnL +2.175163
+gross PnL +2.175850
+maker rebate -0.000687
+fills 8025
+PnL/fill +0.00027105
+positive days 27/32
+active-day positive days 27/32
+
+3 月段:
+  PnL +1.285163
+  fills 3953
+  PnL/fill +0.00032511
+  positive days 13/15
+  worst 20260324 -0.048450
+  best 20260323 +0.302750
+
+4 月段:
+  PnL +0.890000
+  fills 4072
+  PnL/fill +0.00021857
+  positive days 14/17
+  worst 20260406 -0.044850
+  best 20260412 +0.141950
+```
+
+Conclusion:
+
+```text
+This is a strong additional validation for the current new22 candidate.
+The previous period is materially stronger than 20260418-20260518:
+  +2.175163 vs +0.806400 total PnL.
+  27/32 positive days vs 18/31.
+
+Do not change the main candidate based on this alone; it reinforces it.
+The next bottleneck remains bad-day mechanics and quote-distance refinement,
+especially because the later month still contains clear loss days.
 ```
