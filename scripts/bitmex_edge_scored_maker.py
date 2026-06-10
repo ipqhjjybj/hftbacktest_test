@@ -68,6 +68,11 @@ QUOTE_EDGE_IF_FILLED_WIDEN_MULT = 0.5
 QUOTE_REGIME_WIDEN_THRESHOLD_BPS = 0.04
 QUOTE_REGIME_WIDEN_MULT = 20.0
 QUOTE_MAX_SCORE_WIDEN_BPS = 2.0
+QUOTE_SCORE_WIDEN_MAX_REGIME_BPS = 999.0
+QUOTE_BID_SCORE_WIDEN_MULT = 1.0
+QUOTE_ASK_SCORE_WIDEN_MULT = 1.0
+QUOTE_BID_REGIME_WIDEN_MULT = 1.0
+QUOTE_ASK_REGIME_WIDEN_MULT = 1.0
 USE_STALE_QUOTE_CONTROL = False
 STALE_QUOTE_TTL_NS = 500_000_000
 STALE_QUOTE_MIN_EDGE_IF_FILLED_MARGIN_BPS = 1.0
@@ -838,11 +843,21 @@ def quote_half_spread_bps(side, depth, pos, scores, thresholds, metrics, positio
     if USE_SCORE_AWARE_QUOTE_DISTANCE and not is_reduce_side(side, pos):
         _, edge_if_filled, _, _, edge_if_filled_threshold, _ = side_score_values(side, scores, thresholds)
         edge_if_filled_margin = edge_if_filled - edge_if_filled_threshold
-        score_widen = max(0.0, QUOTE_EDGE_IF_FILLED_WIDEN_TARGET_BPS - edge_if_filled_margin)
-        score_widen *= QUOTE_EDGE_IF_FILLED_WIDEN_MULT
-
         regime = side_regime_ewm(side, metrics)
+        score_widen = 0.0
+        if regime <= QUOTE_SCORE_WIDEN_MAX_REGIME_BPS:
+            score_widen = max(0.0, QUOTE_EDGE_IF_FILLED_WIDEN_TARGET_BPS - edge_if_filled_margin)
+            score_widen *= QUOTE_EDGE_IF_FILLED_WIDEN_MULT
+            if side > 0:
+                score_widen *= QUOTE_BID_SCORE_WIDEN_MULT
+            else:
+                score_widen *= QUOTE_ASK_SCORE_WIDEN_MULT
+
         regime_widen = max(0.0, QUOTE_REGIME_WIDEN_THRESHOLD_BPS - regime) * QUOTE_REGIME_WIDEN_MULT
+        if side > 0:
+            regime_widen *= QUOTE_BID_REGIME_WIDEN_MULT
+        else:
+            regime_widen *= QUOTE_ASK_REGIME_WIDEN_MULT
         widen = score_widen + regime_widen
         if widen > QUOTE_MAX_SCORE_WIDEN_BPS:
             widen = QUOTE_MAX_SCORE_WIDEN_BPS
@@ -1767,6 +1782,11 @@ def write_summary(result_npz: Path, yyyymmdd: str, model_path: Path, model: dict
         "quote_regime_widen_threshold_bps": QUOTE_REGIME_WIDEN_THRESHOLD_BPS,
         "quote_regime_widen_mult": QUOTE_REGIME_WIDEN_MULT,
         "quote_max_score_widen_bps": QUOTE_MAX_SCORE_WIDEN_BPS,
+        "quote_score_widen_max_regime_bps": QUOTE_SCORE_WIDEN_MAX_REGIME_BPS,
+        "quote_bid_score_widen_mult": QUOTE_BID_SCORE_WIDEN_MULT,
+        "quote_ask_score_widen_mult": QUOTE_ASK_SCORE_WIDEN_MULT,
+        "quote_bid_regime_widen_mult": QUOTE_BID_REGIME_WIDEN_MULT,
+        "quote_ask_regime_widen_mult": QUOTE_ASK_REGIME_WIDEN_MULT,
         "stale_quote_control": USE_STALE_QUOTE_CONTROL,
         "stale_quote_ttl_ms": STALE_QUOTE_TTL_NS / 1_000_000.0,
         "stale_quote_min_edge_if_filled_margin_bps": STALE_QUOTE_MIN_EDGE_IF_FILLED_MARGIN_BPS,
@@ -2011,6 +2031,11 @@ def write_aggregate(summaries: list[dict]) -> Path:
         "quote_regime_widen_threshold_bps",
         "quote_regime_widen_mult",
         "quote_max_score_widen_bps",
+        "quote_score_widen_max_regime_bps",
+        "quote_bid_score_widen_mult",
+        "quote_ask_score_widen_mult",
+        "quote_bid_regime_widen_mult",
+        "quote_ask_regime_widen_mult",
         "stale_quote_control",
         "stale_quote_ttl_ms",
         "stale_quote_min_edge_if_filled_margin_bps",
@@ -2098,6 +2123,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quote-regime-widen-threshold-bps", type=float, default=QUOTE_REGIME_WIDEN_THRESHOLD_BPS)
     parser.add_argument("--quote-regime-widen-mult", type=float, default=QUOTE_REGIME_WIDEN_MULT)
     parser.add_argument("--quote-max-score-widen-bps", type=float, default=QUOTE_MAX_SCORE_WIDEN_BPS)
+    parser.add_argument("--quote-score-widen-max-regime-bps", type=float, default=QUOTE_SCORE_WIDEN_MAX_REGIME_BPS)
+    parser.add_argument("--quote-bid-score-widen-mult", type=float, default=QUOTE_BID_SCORE_WIDEN_MULT)
+    parser.add_argument("--quote-ask-score-widen-mult", type=float, default=QUOTE_ASK_SCORE_WIDEN_MULT)
+    parser.add_argument("--quote-bid-regime-widen-mult", type=float, default=QUOTE_BID_REGIME_WIDEN_MULT)
+    parser.add_argument("--quote-ask-regime-widen-mult", type=float, default=QUOTE_ASK_REGIME_WIDEN_MULT)
     parser.add_argument("--stale-quote-control", action="store_true")
     parser.add_argument("--stale-quote-ttl-ms", type=float, default=STALE_QUOTE_TTL_NS / 1_000_000.0)
     parser.add_argument(
@@ -2151,6 +2181,8 @@ def apply_args(args: argparse.Namespace) -> None:
     global USE_SCORE_AWARE_QUOTE_DISTANCE, QUOTE_EDGE_IF_FILLED_WIDEN_TARGET_BPS
     global QUOTE_EDGE_IF_FILLED_WIDEN_MULT, QUOTE_REGIME_WIDEN_THRESHOLD_BPS
     global QUOTE_REGIME_WIDEN_MULT, QUOTE_MAX_SCORE_WIDEN_BPS
+    global QUOTE_SCORE_WIDEN_MAX_REGIME_BPS, QUOTE_BID_SCORE_WIDEN_MULT, QUOTE_ASK_SCORE_WIDEN_MULT
+    global QUOTE_BID_REGIME_WIDEN_MULT, QUOTE_ASK_REGIME_WIDEN_MULT
     global USE_STALE_QUOTE_CONTROL, STALE_QUOTE_TTL_NS
     global STALE_QUOTE_MIN_EDGE_IF_FILLED_MARGIN_BPS, STALE_QUOTE_MIN_REGIME_BPS
     global POSITION_AGE_REDUCE_ONLY_NS, POSITION_AGE_REDUCE_TIGHTEN_BPS, POSITION_AGE_MARKET_EXIT_NS
@@ -2182,6 +2214,11 @@ def apply_args(args: argparse.Namespace) -> None:
     QUOTE_REGIME_WIDEN_THRESHOLD_BPS = args.quote_regime_widen_threshold_bps
     QUOTE_REGIME_WIDEN_MULT = args.quote_regime_widen_mult
     QUOTE_MAX_SCORE_WIDEN_BPS = args.quote_max_score_widen_bps
+    QUOTE_SCORE_WIDEN_MAX_REGIME_BPS = args.quote_score_widen_max_regime_bps
+    QUOTE_BID_SCORE_WIDEN_MULT = args.quote_bid_score_widen_mult
+    QUOTE_ASK_SCORE_WIDEN_MULT = args.quote_ask_score_widen_mult
+    QUOTE_BID_REGIME_WIDEN_MULT = args.quote_bid_regime_widen_mult
+    QUOTE_ASK_REGIME_WIDEN_MULT = args.quote_ask_regime_widen_mult
     USE_STALE_QUOTE_CONTROL = args.stale_quote_control
     STALE_QUOTE_TTL_NS = int(args.stale_quote_ttl_ms * 1_000_000)
     STALE_QUOTE_MIN_EDGE_IF_FILLED_MARGIN_BPS = args.stale_quote_min_edge_if_filled_margin_bps

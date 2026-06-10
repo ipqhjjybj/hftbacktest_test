@@ -140,11 +140,13 @@ Implemented:
   score-aware quote distance
   stale quote control
   side/regime-aware quote widening
+  weak-regime-gated score widening
   position-age reduce-only control
 
 Result:
   strict and light stacked probes both underperformed the current baseline on bad3+good3.
   decomposed quote-control probes also did not beat baseline.
+  weak-regime-gated score widening passed bad3+good3 but missed the current full-month best.
   Do not promote yet.
 
 Decomposed probe result:
@@ -153,10 +155,19 @@ Decomposed probe result:
   stale-only +0.239450, bad3 -0.160000, good3 +0.399450.
   position-age-only +0.293400, bad3 -0.169250, good3 +0.462650.
   fill-prob-widen-only +0.194350, bad3 -0.170300, good3 +0.364650.
+  weakregime-score +0.304750, bad3 -0.158600, good3 +0.463350.
+
+Weak-regime monthly result:
+  result:
+    results/bitmex_xbtusdt_edge_scored_maker_edge_scored_new22_quotedist_score_weakregime_t002_20260418_20260518.aggregate.csv
+  total +0.802150 vs current best +0.806400.
+  4 月 improved to -0.032350, worst day improved to 20260421 -0.064250.
+  5 月 slipped to +0.834500, mainly from giveback on 20260504/20260514.
 
 Next:
-  only refine quote-distance; it is the only layer that improved bad3,
-  but it worsened 20260421 and gave back too much good-day PnL.
+  current best remains unchanged.
+  only continue quote-distance if the next variant explicitly reduces good-day giveback,
+  especially on 20260504/20260514, before another full-month run.
 ```
 
 Initial attribution:

@@ -872,6 +872,340 @@ Make it side/day/regime-aware instead of global:
      if it gives back more on 20260514/20260515/20260517.
 ```
 
+## 2026-05-27 New22 Weak-Regime Score Widening
+
+Purpose:
+
+```text
+Refine quote-distance after the decomposed probe showed that global
+score-aware widening helped bad3 but worsened 20260421 and gave back too much
+good-day PnL.
+```
+
+Attribution note:
+
+```text
+20260421 baseline vs quote-distance-only showed that the worse result was not
+from the main 13 UTC bid-entry bad bucket getting worse.  It came mostly from
+removing or changing profitable bid-entry groups around 14/8/20 UTC.
+
+This points to the score-margin widening layer being too global.  Weak regime
+widening is steadier, but by itself barely improves bad3.
+```
+
+Implementation:
+
+```text
+scripts/bitmex_edge_scored_maker.py now supports:
+  quote_score_widen_max_regime_bps
+  quote_bid_score_widen_mult / quote_ask_score_widen_mult
+  quote_bid_regime_widen_mult / quote_ask_regime_widen_mult
+
+Defaults preserve old behavior.
+```
+
+Tested variant:
+
+```text
+score-aware quote distance on
+quote_edge_if_filled_widen_target 0.75
+quote_edge_if_filled_widen_mult 0.25
+quote_regime_widen_threshold 0.02
+quote_regime_widen_mult 10.0
+quote_max_score_widen 1.0
+quote_score_widen_max_regime 0.02
+```
+
+Bad3+good3 result:
+
+```text
+result:
+  results/bitmex_xbtusdt_edge_scored_maker_edge_scored_new22_quotedist_score_weakregime_t002_bad3_good3.aggregate.csv
+
+variant              total       fills  bad3       good3
+baseline             +0.299850   1014   -0.166050  +0.465900
+quote_distance_old   +0.269050    946   -0.150700  +0.419750
+regime_only          +0.297250   1010   -0.164550  +0.461800
+weakregime_score     +0.304750   1000   -0.158600  +0.463350
+
+daily:
+20260420  -0.043050 vs baseline -0.046350
+20260421  -0.064250 vs baseline -0.065500
+20260512  -0.051300 vs baseline -0.054200
+20260514  +0.207800 vs baseline +0.216500
+20260515  +0.134850 vs baseline +0.130450
+20260517  +0.120700 vs baseline +0.118950
+```
+
+Full-month result:
+
+```text
+result:
+  results/bitmex_xbtusdt_edge_scored_maker_edge_scored_new22_quotedist_score_weakregime_t002_20260418_20260518.aggregate.csv
+
+baseline current best:
+  total +0.806400
+  fills 3430
+  PnL/fill +0.00023510
+  positive days 18/31
+  active-day positive days 18/28
+  4 月 -0.037700
+  5 月 +0.844100
+  worst 20260421 -0.065500
+
+weakregime_score:
+  total +0.802150
+  fills 3386
+  PnL/fill +0.00023690
+  positive days 18/31
+  active-day positive days 18/28
+  4 月 -0.032350
+  5 月 +0.834500
+  worst 20260421 -0.064250
+```
+
+Conclusion:
+
+```text
+Do not promote weakregime_score over the current best.
+
+It passes bad3+good3 and improves 4 月 / worst day slightly, but full-month
+PnL is lower by 0.004250 because it gives back enough 5 月 upside
+to offset the bad-day improvements.
+
+Main giveback days:
+  20260504 -0.014850 vs baseline
+  20260514 -0.008700
+  20260429 -0.006950
+
+Useful next direction:
+  Keep the new side/regime-aware parameters.
+  If continuing quote-distance, reduce good-day giveback before another
+  full-month run, especially around high-upside days like 20260504/20260514.
+```
+
+## 2026-05-27 Good-Day Giveback Constraints
+
+Purpose:
+
+```text
+Try to reduce weakregime_score giveback on 20260504/20260514 without losing
+the bad3 improvement.
+```
+
+Probe 1: tighter regime trigger
+
+```text
+result:
+  results/bitmex_xbtusdt_edge_scored_maker_edge_scored_new22_quotedist_score_regime_t001_bad3_good3.aggregate.csv
+
+params changed from weakregime_score:
+  quote_regime_widen_threshold 0.01
+  quote_score_widen_max_regime 0.01
+
+6-day result:
+  total +0.299850
+  bad3 -0.166050
+  good3 +0.465900
+
+Conclusion:
+  This fully protects good3, but it also removes the bad3 improvement.
+  It is effectively back to baseline behavior.
+```
+
+Probe 2: bid-focused widening, softer ask widening
+
+```text
+result:
+  results/bitmex_xbtusdt_edge_scored_maker_edge_scored_new22_quotedist_bidfocus_askhalf_bad3_good3.aggregate.csv
+  results/bitmex_xbtusdt_edge_scored_maker_edge_scored_new22_quotedist_bidfocus_askhalf_20260504.aggregate.csv
+
+params changed from weakregime_score:
+  quote_ask_score_widen_mult 0.0
+  quote_ask_regime_widen_mult 0.5
+
+6-day result:
+  total +0.301250
+  bad3 -0.163650
+  good3 +0.464900
+
+key days:
+  20260504 +0.147200 vs baseline +0.151450 and weakregime +0.136600
+  20260514 +0.207700 vs baseline +0.216500 and weakregime +0.207800
+
+Conclusion:
+  This recovers part of 20260504 but does not fix 20260514.
+  Bad3 improvement is also smaller than weakregime_score.
+  Do not run full-month validation for this parameter set.
+```
+
+Updated conclusion:
+
+```text
+The current quote-distance controls are not selective enough.
+
+Lowering regime trigger protects good days but loses the bad-day fix.
+Side-specific ask softening helps 20260504 somewhat but does not solve 20260514.
+
+Do not promote any constrained quote-distance variant.
+The current best remains new22 e95/i97/regime_min=0.01/hard-risk.
+```
+
+### 20260514 Entry/Fill Pattern Attribution
+
+Purpose:
+
+```text
+Explain why weakregime_score gives back 20260514 even though the day has strong
+positive PnL and mostly positive side regime.
+```
+
+Files compared:
+
+```text
+baseline:
+  results/bitmex_xbtusdt_edge_scored_maker_edge_scored_new22_e95_i97_m001_a00005_20260418_20260518_20260514.fills.csv
+
+weakregime_score:
+  results/bitmex_xbtusdt_edge_scored_maker_edge_scored_new22_quotedist_score_weakregime_t002_20260418_20260518_20260514.fills.csv
+
+bidfocus_askhalf:
+  results/bitmex_xbtusdt_edge_scored_maker_edge_scored_new22_quotedist_bidfocus_askhalf_bad3_good3_20260514.fills.csv
+
+regime_t001:
+  results/bitmex_xbtusdt_edge_scored_maker_edge_scored_new22_quotedist_score_regime_t001_bad3_good3_20260514.fills.csv
+```
+
+Day-level comparison:
+
+```text
+variant          pnl        fills  bid fill pnl  ask fill pnl
+baseline         +0.216500  270    +0.113825    +0.102675
+weakregime       +0.207800  266    +0.107100    +0.100700
+bidfocus_askhalf +0.207700  266    +0.109175    +0.098525
+regime_t001      +0.216500  270    +0.113825    +0.102675
+```
+
+Main attribution:
+
+```text
+The giveback is concentrated in 03 UTC entry sequencing.
+
+Entry round-trip delta vs baseline:
+  weakregime 03 UTC ask entries:
+    trips 10 -> 8
+    PnL +0.004400 -> -0.001350
+    delta -0.005750
+
+  weakregime 03 UTC bid entries:
+    trips 5 -> 6
+    PnL -0.002500 -> -0.005350
+    delta -0.002850
+
+Combined 03 UTC entry delta:
+  about -0.008600, which explains almost all of the daily
+  weakregime giveback vs baseline (-0.008700).
+```
+
+Detailed pattern:
+
+```text
+Baseline had three consecutive profitable 03 UTC trips:
+  bid entry, pnl +0.000350, entry regime +0.0199
+  ask entry, pnl +0.003550, entry regime +0.0234
+  ask entry, pnl +0.002250, entry regime +0.0293
+
+weakregime changed this local sequence into:
+  bid entry, pnl -0.000750, entry regime +0.0196, entry spread 3.124bps
+  bid entry, pnl -0.001750, placement record not valid / spread 0 in attribution
+
+After that, the rest of the major profitable 14/15/16/17 UTC buckets are
+nearly unchanged.
+```
+
+Interpretation:
+
+```text
+20260514 is not a broad good-day degradation.
+It is a path-dependence issue around 03 UTC caused by quote-distance triggering
+in a narrow positive-but-low regime band.
+
+regime_t001 matches baseline exactly, so the harmful trigger band is roughly:
+  0.01 < side regime <= 0.02
+
+Disabling or weakening ask-side widening does not fix it because the local path
+change starts around early 03 UTC placement timing and then changes the next
+entry side sequence.
+```
+
+Implication:
+
+```text
+Do not keep hand-sweeping global quote-distance knobs.
+
+If quote-distance is revisited, the next test should separate:
+  1. score widening only when side regime is negative, not merely below +0.02.
+  2. regime widening in low-positive regime vs negative regime.
+  3. path-sensitive effects around early-session sequences like 03 UTC.
+```
+
+### Negative-Regime-Only Widening
+
+Purpose:
+
+```text
+Test whether score/regime widening can keep the bad-day improvement while
+avoiding the 20260504/20260514 good-day giveback by only triggering when side
+regime is negative.
+```
+
+Result:
+
+```text
+results/bitmex_xbtusdt_edge_scored_maker_edge_scored_new22_quotedist_negative_regime_bad3_good3_20260504.aggregate.csv
+```
+
+Params changed from weakregime_score:
+
+```text
+quote_regime_widen_threshold 0.0
+quote_score_widen_max_regime 0.0
+```
+
+7-day guard set comparison:
+
+```text
+variant     total7     bad3       good3      20260504   fills
+baseline    +0.451300  -0.166050  +0.465900  +0.151450  1314
+weakregime  +0.441350  -0.158600  +0.463350  +0.136600  1300
+negreg      +0.451300  -0.166050  +0.465900  +0.151450  1314
+```
+
+Day-level check:
+
+```text
+date      baseline   negreg
+20260420  -0.046350  -0.046350
+20260421  -0.065500  -0.065500
+20260504  +0.151450  +0.151450
+20260512  -0.054200  -0.054200
+20260514  +0.216500  +0.216500
+20260515  +0.130450  +0.130450
+20260517  +0.118950  +0.118950
+```
+
+Conclusion:
+
+```text
+Negative-regime-only widening fully protects 20260504/20260514, but it also
+collapses back to baseline on the bad3 set. The weakregime bad-day improvement
+comes from including at least part of the low-positive regime band, while that
+same band creates the 20260514 path-dependence giveback.
+
+Do not run full-month validation for this variant.
+Do not promote.
+```
+
 ## 2026-05-26 New22 Previous-Period Validation
 
 Purpose:
